@@ -2,6 +2,12 @@ plugins {
     id 'com.android.application'
 }
 
+def releaseSigning = ['MUSE_KEYSTORE_FILE', 'MUSE_KEYSTORE_PASSWORD', 'MUSE_KEY_ALIAS', 'MUSE_KEY_PASSWORD']
+        .collectEntries { key -> [(key): providers.environmentVariable(key).orNull] }
+if (releaseSigning.values().any { it } && !releaseSigning.values().every { it }) {
+    throw new GradleException('Release signing requires all four MUSE_KEYSTORE / MUSE_KEY environment variables')
+}
+
 android {
     namespace 'com.seekstars.muselauncher'
     compileSdk 34
@@ -10,18 +16,29 @@ android {
         applicationId "com.seekstars.muselauncher"
         minSdk 29
         targetSdk 34
-        versionCode 3
-        versionName "1.2"
+        versionCode 4
+        versionName "1.2.1"
     }
 
     buildFeatures {
         buildConfig true
     }
 
+    signingConfigs {
+        if (releaseSigning.values().every { it }) {
+            releaseKey {
+                storeFile file(releaseSigning.MUSE_KEYSTORE_FILE)
+                storePassword releaseSigning.MUSE_KEYSTORE_PASSWORD
+                keyAlias releaseSigning.MUSE_KEY_ALIAS
+                keyPassword releaseSigning.MUSE_KEY_PASSWORD
+            }
+        }
+    }
+
     buildTypes {
         release {
             minifyEnabled false
-            signingConfig signingConfigs.debug
+            if (releaseSigning.values().every { it }) signingConfig signingConfigs.releaseKey
         }
     }
 
@@ -29,13 +46,24 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
+
+    testOptions {
+        unitTests.includeAndroidResources = true
+        unitTests.all {
+            systemProperty 'robolectric.dependency.repo.url', 'https://repo.maven.apache.org/maven2'
+        }
+    }
 }
 
 dependencies {
     implementation 'androidx.appcompat:appcompat:1.7.0'
     implementation 'androidx.webkit:webkit:1.12.1'
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
     testImplementation 'junit:junit:4.13.2'
     testImplementation 'org.json:json:20231013'
+    testImplementation 'org.robolectric:robolectric:4.13'
+    testImplementation 'com.squareup.okhttp3:mockwebserver:4.12.0'
+    testImplementation 'com.squareup.okhttp3:okhttp-tls:4.12.0'
     constraints {
         implementation('org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.22') {
             because('kotlin-stdlib 1.8+ merged jdk7/jdk8, align old transitive pins')

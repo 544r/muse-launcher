@@ -13,6 +13,16 @@ import java.util.Map;
  */
 public class LruAccountRegistry<T> {
 
+    public static final class Evicted<T> {
+        public final long id;
+        public final T value;
+
+        Evicted(long id, T value) {
+            this.id = id;
+            this.value = value;
+        }
+    }
+
     private final int maxAlive;
     /** accessOrder=true：get/put 都会刷新访问顺序， eldest 是最久未用 */
     private final LinkedHashMap<Long, T> map = new LinkedHashMap<>(16, 0.75f, true);
@@ -48,17 +58,16 @@ public class LruAccountRegistry<T> {
 
     /**
      * 放入（或刷新）id 对应的资源并标记为最近使用；若总量超出 maxAlive，
-     * 从最久未用的开始返回应驱逐的 id。返回列表永远不包含 id 本身。
+     * 返回已移出的资源，由调用方销毁；不能再次 remove 查找它们。
      */
-    public List<Long> touchAndEvict(long id, T value) {
+    public List<Evicted<T>> touchAndEvict(long id, T value) {
         map.put(id, value); // accessOrder=true：put 同时刷新为最新
-        List<Long> evict = new ArrayList<>();
+        List<Evicted<T>> evict = new ArrayList<>();
         while (map.size() > maxAlive) {
             Long eldest = map.keySet().iterator().next();
             if (eldest == null) break;
             if (eldest == id) break; // 理论不可达（刚 put 的 id 最新），防御性保护
-            evict.add(eldest);
-            map.remove(eldest);
+            evict.add(new Evicted<>(eldest, map.remove(eldest)));
         }
         return evict;
     }

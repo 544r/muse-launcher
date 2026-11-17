@@ -30,7 +30,7 @@ public class LruAccountRegistryTest {
         LruAccountRegistry<String> r = new LruAccountRegistry<>(3);
         r.put(1L, "a");
         r.put(2L, "b");
-        List<Long> evict = r.touchAndEvict(2L, "b2");
+        List<LruAccountRegistry.Evicted<String>> evict = r.touchAndEvict(2L, "b2");
         assertTrue(evict.isEmpty());
         assertEquals(2, r.size());
         assertEquals("b2", r.get(2L));
@@ -42,9 +42,9 @@ public class LruAccountRegistryTest {
         r.put(1L, "a");
         r.put(2L, "b");
         r.put(3L, "c");
-        List<Long> evict = r.touchAndEvict(4L, "d"); // 放入第 4 个
+        List<LruAccountRegistry.Evicted<String>> evict = r.touchAndEvict(4L, "d"); // 放入第 4 个
         assertEquals(1, evict.size());
-        assertEquals(Long.valueOf(1L), evict.get(0)); // 最久未用的 1 被驱逐
+        assertEquals(Long.valueOf(1L), Long.valueOf(evict.get(0).id)); // 最久未用的 1 被驱逐
         assertFalse(r.contains(1L));
         assertEquals(3, r.size());
         // 刚放入的 4 绝不会被驱逐
@@ -59,9 +59,9 @@ public class LruAccountRegistryTest {
         r.put(3L, "c");
         // 访问 1，使 2 变成最旧
         r.get(1L);
-        List<Long> evict = r.touchAndEvict(4L, "d");
+        List<LruAccountRegistry.Evicted<String>> evict = r.touchAndEvict(4L, "d");
         assertEquals(1, evict.size());
-        assertEquals(Long.valueOf(2L), evict.get(0));
+        assertEquals(Long.valueOf(2L), Long.valueOf(evict.get(0).id));
         assertTrue(r.contains(1L));
         assertTrue(r.contains(3L));
         assertTrue(r.contains(4L));
@@ -72,8 +72,8 @@ public class LruAccountRegistryTest {
         LruAccountRegistry<String> r = new LruAccountRegistry<>(2);
         r.put(1L, "a");
         r.put(2L, "b");
-        List<Long> evict = r.touchAndEvict(1L, "a2"); // 刷新已存在的 1
-        assertTrue(evict.isEmpty() || !evict.contains(1L));
+        List<LruAccountRegistry.Evicted<String>> evict = r.touchAndEvict(1L, "a2"); // 刷新已存在的 1
+        assertTrue(evict.isEmpty() || evict.stream().noneMatch(item -> item.id == 1L));
         assertTrue(r.contains(1L));
         assertEquals("a2", r.get(1L));
     }
@@ -82,9 +82,9 @@ public class LruAccountRegistryTest {
     public void capacityOne_keepsOnlyTouched() {
         LruAccountRegistry<String> r = new LruAccountRegistry<>(1);
         r.put(1L, "a");
-        List<Long> evict = r.touchAndEvict(2L, "b");
+        List<LruAccountRegistry.Evicted<String>> evict = r.touchAndEvict(2L, "b");
         assertEquals(1, evict.size());
-        assertEquals(Long.valueOf(1L), evict.get(0));
+        assertEquals(Long.valueOf(1L), Long.valueOf(evict.get(0).id));
         assertEquals(1, r.size());
         assertEquals("b", r.get(2L));
     }
@@ -104,11 +104,30 @@ public class LruAccountRegistryTest {
     public void massEviction_multipleAtOnce() {
         LruAccountRegistry<String> r = new LruAccountRegistry<>(2);
         for (long id = 1; id <= 5; id++) r.put(id, "v" + id);
-        List<Long> evict = r.touchAndEvict(6L, "v6");
+        List<LruAccountRegistry.Evicted<String>> evict = r.touchAndEvict(6L, "v6");
         // 6 个超出容量 2：应驱逐 1..4（按插入序），保留 5、6
-        assertEquals(java.util.Arrays.asList(1L, 2L, 3L, 4L), evict);
+        assertEquals(java.util.Arrays.asList(1L, 2L, 3L, 4L), evict.stream().map(item -> item.id).collect(java.util.stream.Collectors.toList()));
         assertTrue(r.contains(5L));
         assertTrue(r.contains(6L));
         assertEquals(2, r.size());
+    }
+    @Test
+    public void evictedResourcesAreAvailableForDestructionExactlyOnce() {
+        LruAccountRegistry<Object> registry = new LruAccountRegistry<>(4);
+        java.util.Set<Object> container = new java.util.HashSet<>();
+        java.util.Set<Object> destroyed = new java.util.HashSet<>();
+        for (long id = 1; id <= 20; id++) {
+            Object view = new Object();
+            container.add(view);
+            registry.put(id, view);
+            for (LruAccountRegistry.Evicted<Object> item : registry.touchAndEvict(id, view)) {
+                assertTrue(container.remove(item.value));
+                assertTrue(destroyed.add(item.value));
+                assertNull(registry.remove(item.id));
+            }
+            assertEquals(registry.size(), container.size());
+            assertTrue(container.size() <= 4);
+        }
+        assertEquals(16, destroyed.size());
     }
 }

@@ -5,9 +5,17 @@ import org.json.JSONObject;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.HashSet;
+import java.util.Set;
 
 /** 账号列表 JSON 编解码（纯 Java，可单元测试）。读取对损坏数据有容错。 */
 final class AccountJsonCodec {
+
+    static final class Decoded {
+        final List<Account> accounts = new ArrayList<>();
+        boolean damaged;
+        long highestId;
+    }
 
     private AccountJsonCodec() {
     }
@@ -16,7 +24,11 @@ final class AccountJsonCodec {
     static String toJson(List<Account> accounts) {
         try {
             JSONArray arr = new JSONArray();
+            Set<Long> ids = new HashSet<>();
             for (Account a : accounts) {
+                if (a == null || a.id <= 0 || !ids.add(a.id) || a.name == null || a.tags == null) {
+                    return null;
+                }
                 JSONObject o = new JSONObject();
                 o.put("id", a.id);
                 o.put("name", a.name);
@@ -40,6 +52,11 @@ final class AccountJsonCodec {
      *         数组合法但某一条目字段损坏时跳过该条目，其余照常返回。
      */
     static List<Account> fromJsonOrNull(String raw) {
+        Decoded result = decode(raw);
+        return result == null ? null : result.accounts;
+    }
+
+    static Decoded decode(String raw) {
         if (raw == null) return null;
         JSONArray arr;
         try {
@@ -47,11 +64,18 @@ final class AccountJsonCodec {
         } catch (Exception e) {
             return null;
         }
-        List<Account> out = new ArrayList<>();
+        Decoded out = new Decoded();
+        Set<Long> ids = new HashSet<>();
         for (int i = 0; i < arr.length(); i++) {
             try {
                 JSONObject o = arr.getJSONObject(i);
-                Account a = new Account(o.getLong("id"), o.getString("name"));
+                // 即使其余字段损坏，也保留 ID 高水位，防止复用旧 Profile。
+                Object rawId = o.get("id");
+                long id = Long.parseLong(rawId.toString());
+                if (id <= 0) throw new IllegalArgumentException("Invalid account id");
+                out.highestId = Math.max(out.highestId, id);
+                if (!ids.add(id)) throw new IllegalArgumentException("Duplicate account id");
+                Account a = new Account(id, o.getString("name"));
                 a.avatar = o.optString("avatar", "m");
                 a.proxy = o.optString("proxy", "");
                 JSONArray tagArr = o.optJSONArray("tags");
@@ -61,9 +85,9 @@ final class AccountJsonCodec {
                         if (!t.isEmpty()) a.tags.add(t);
                     }
                 }
-                out.add(a);
+                out.accounts.add(a);
             } catch (Exception ignoredEntry) {
-                // 单条损坏不影响其余条目
+                out.damaged = true;
             }
         }
         return out;

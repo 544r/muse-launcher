@@ -1,55 +1,49 @@
 package com.seekstars.muselauncher;
 
+import android.os.Handler;
+import android.os.Looper;
 import androidx.webkit.ProxyConfig;
 import androidx.webkit.ProxyController;
 import androidx.webkit.WebViewFeature;
 
-import java.util.concurrent.Executor;
+/** WebView 代理为进程级设置；所有完成通知均在主线程串行执行。 */
+public final class ProxyHelper {
+    private static final Handler MAIN = new Handler(Looper.getMainLooper());
+    private static final SerialProxyQueue QUEUE = new SerialProxyQueue(ProxyHelper::applyNow);
 
-/**
- * 按账号应用/清除 WebView 代理。
- * ProxyController 是 App 级全局开关，本应用同一时刻只有一个账号在前台，切换时应用对应代理即可。
- * proxy 为空表示清除覆盖，走系统网络。
- */
-public class ProxyHelper {
-
-    private static ProxyController controller;
-    private static final Executor EXEC = Runnable::run;
-
-    private ProxyHelper() {
-    }
+    private ProxyHelper() {}
 
     public static boolean supported() {
         return WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE);
     }
 
-    public static void apply(String proxy) {
-        if (!supported()) return;
-        try {
-            if (controller == null) controller = ProxyController.getInstance();
-            if (proxy == null || proxy.trim().isEmpty()) {
-                controller.clearProxyOverride(EXEC, () -> {
-                });
-                return;
-            }
-            String rule = normalize(proxy.trim());
-            ProxyConfig config = new ProxyConfig.Builder()
-                    .addProxyRule(rule)
-                    .addDirect()
-                    .build();
-            controller.setProxyOverride(config, EXEC, () -> {
-            });
-        } catch (Exception ignored) {
+    public static void apply(String proxy, SerialProxyQueue.Completion completion) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            MAIN.post(() -> QUEUE.apply(proxy, completion));
+        } else {
+            QUEUE.apply(proxy, completion);
         }
     }
 
-    /** 统一代理地址格式：补全 scheme（默认 http） */
-    public static String normalize(String p) {
-        String lower = p.toLowerCase();
-        if (lower.startsWith("http://") || lower.startsWith("https://")
-                || lower.startsWith("socks5://") || lower.startsWith("socks4://")) {
-            return p;
+    private static void applyNow(String value, SerialProxyQueue.Completion completion) {
+        try {
+            ProxySpec spec = ProxySpec.parse(value);
+            if (!supported()) {
+                completion.done(spec.rule.isEmpty() ? null : "当前系统 WebView 不支持代理，请先更新");
+                return;
+            }
+            ProxyController controller = ProxyController.getInstance();
+            if (spec.rule.isEmpty()) {
+                controller.clearProxyOverride(MAIN::post, () -> completion.done(null));
+            } else {
+                // 代理不可用时失败，不能静默回退直连。
+                ProxyConfig config = new ProxyConfig.Builder().addProxyRule(spec.rule).build();
+                controller.setProxyOverride(config, MAIN::post, () -> completion.done(null));
+            }
+        } catch (IllegalArgumentException e) {
+            completion.done("代理配置无效，请检查协议、主机和端口");
+        } catch (RuntimeException e) {
+            completion.done("无法应用代理，请更新系统 WebView 后重试");
         }
-        return "http://" + p;
     }
 }

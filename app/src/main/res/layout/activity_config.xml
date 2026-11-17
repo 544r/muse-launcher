@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="@color/bg"
@@ -23,7 +24,7 @@
             android:background="@drawable/bg_rail_btn"
             android:contentDescription="@string/btn_cancel"
             android:src="@drawable/ic_chevron_left"
-            android:tint="#AEB4BD" />
+            app:tint="#AEB4BD" />
 
         <TextView
             android:layout_width="0dp"
@@ -108,7 +109,6 @@
                     android:layout_marginTop="12dp"
                     android:background="@drawable/bg_input"
                     android:inputType="text"
-                    android:maxLength="4"
                     android:maxLines="1"
                     android:padding="11dp"
                     android:hint="@string/config_avatar_hint"
@@ -141,7 +141,6 @@
                     android:layout_marginTop="10dp"
                     android:background="@drawable/bg_input"
                     android:inputType="text"
-                    android:maxLength="16"
                     android:maxLines="1"
                     android:padding="11dp"
                     android:textColor="@color/text_primary"

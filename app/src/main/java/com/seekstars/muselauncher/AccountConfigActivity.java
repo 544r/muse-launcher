@@ -1,74 +1,47 @@
 package com.seekstars.muselauncher;
 
-import android.graphics.Typeface;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
-import android.os.SystemClock;
 import android.text.Editable;
-import android.text.InputType;
 import android.text.TextUtils;
 import android.text.TextWatcher;
 import android.view.View;
-import android.webkit.HttpAuthHandler;
-import android.webkit.WebResourceError;
-import android.webkit.WebResourceRequest;
-import android.webkit.WebView;
-import android.webkit.WebViewClient;
 import android.widget.EditText;
 import android.widget.TextView;
-
+import android.widget.Toast;
 import androidx.appcompat.app.AppCompatActivity;
-
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.util.ArrayList;
 import java.util.List;
 
-/** 账号配置页：头像 / 名称 / 代理 / 标签，代理测活 */
+/** 编辑账号；代理测活在隔离的服务进程中执行。 */
 public class AccountConfigActivity extends AppCompatActivity {
-
-    private static final String TEST_URL = "https://www.gstatic.com/generate_204";
-    private static final long TEST_TIMEOUT_MS = 10000;
-    /** Clash 默认端口：7890 混合(HTTP+SOCKS) / 7891 纯 HTTP / 7892 纯 SOCKS */
     private static final int[] CLASH_PORTS = {7890, 7891, 7892};
-    private static final int PROBE_TIMEOUT_MS = 400;
-
     private AccountsStore store;
     private Account account;
+    private TextView tile, detectBtn, testBtn, testStatus;
+    private EditText avatarInput, nameInput, proxyInput, tagsInput;
+    private View saveBtn;
+    private ProxyProbeClient probe;
+    private boolean testing;
+    private boolean detecting;
+    private boolean active;
+    private int detectGeneration;
+    private String testedProxy;
 
-    private TextView tile;
-    private EditText avatarInput;
-    private EditText nameInput;
-    private EditText proxyInput;
-    private EditText tagsInput;
-    private TextView detectBtn;
-    private TextView testBtn;
-    private TextView testStatus;
-
-    private final Handler handler = new Handler(Looper.getMainLooper());
-    private Runnable timeoutRunnable;
-    private WebView testWebView;
-    private boolean testing = false;
-    private boolean detecting = false;
-    /** proxy_save 调试模式：测活通过后自动入库（免触摸配置代理） */
-    private boolean pendingSave = false;
-    /** 测活时代理 URL 内嵌的账密（供 407 挑战应答） */
-    private String[] testCreds;
-
-    @Override
-    protected void onCreate(Bundle savedInstanceState) {
+    @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_config);
-
-        long id = getIntent().getLongExtra("account_id", -1L);
-        store = new AccountsStore(this);
-        account = store.findById(id);
-        if (account == null) {
+        try {
+            store = new AccountsStore(this);
+            account = store.findById(getIntent().getLongExtra("account_id", -1L));
+        } catch (RuntimeException e) {
+            Toast.makeText(this, "无法读取账号数据，请重试", Toast.LENGTH_LONG).show();
             finish();
             return;
         }
-
+        if (account == null) { finish(); return; }
+        probe = new ProxyProbeClient(this);
         tile = findViewById(R.id.cfgTile);
         avatarInput = findViewById(R.id.cfgAvatar);
         nameInput = findViewById(R.id.cfgName);
@@ -77,224 +50,178 @@ public class AccountConfigActivity extends AppCompatActivity {
         detectBtn = findViewById(R.id.cfgProxyDetect);
         testBtn = findViewById(R.id.cfgProxyTest);
         testStatus = findViewById(R.id.cfgProxyStatus);
-
+        saveBtn = findViewById(R.id.cfgSave);
         findViewById(R.id.cfgBack).setOnClickListener(v -> finish());
-        findViewById(R.id.cfgSave).setOnClickListener(v -> save());
-        testBtn.setOnClickListener(v -> testProxy());
+        saveBtn.setOnClickListener(v -> save());
+        testBtn.setOnClickListener(v -> testProxy(false, false));
         detectBtn.setOnClickListener(v -> detectProxy());
-
         avatarInput.setText(account.avatar);
         nameInput.setText(account.name);
         proxyInput.setText(account.proxy);
         tagsInput.setText(TextUtils.join(", ", account.tags));
         updateTile();
-        avatarInput.addTextChangedListener(new TextWatcher() {
-            @Override
-            public void beforeTextChanged(CharSequence s, int a, int b, int c) {
+        avatarInput.addTextChangedListener(watcher(this::updateTile));
+        proxyInput.addTextChangedListener(watcher(() -> {
+            testedProxy = null;
+            if (testing) {
+                probe.cancel();
+                setTesting(false);
             }
-
-            @Override
-            public void onTextChanged(CharSequence s, int a, int b, int c) {
-            }
-
-            @Override
-            public void afterTextChanged(Editable s) {
-                updateTile();
-            }
-        });
-
-        if (!ProxyHelper.supported()) {
-            testStatus.setText(R.string.config_proxy_unsupported);
-            testBtn.setEnabled(false);
-            detectBtn.setEnabled(false);
-        }
-
-        // 调试入口：预填代理 + 自动测活/自动保存（真机无法 adb 触摸，用于验证与配置代理）
-        String preset = getIntent().getStringExtra("proxy_preset");
-        if (preset != null) {
-            proxyInput.setText(preset);
-            if (getIntent().getBooleanExtra("proxy_save", false)) {
-                pendingSave = true;
-                proxyInput.post(this::testProxy);
-            } else if (getIntent().getBooleanExtra("proxy_autotest", false)) {
-                proxyInput.post(this::testProxy);
+            testStatus.setText("");
+        }));
+        if (BuildConfig.DEBUG && savedInstanceState == null) {
+            String preset = getIntent().getStringExtra("proxy_preset");
+            if (preset != null) {
+                proxyInput.setText(preset);
+                proxyInput.post(() -> {
+                    if (!active) return;
+                    if (getIntent().getBooleanExtra("proxy_save", false)) {
+                        if (preset.trim().isEmpty()) persist("", false);
+                        else testProxy(true, false);
+                    } else if (getIntent().getBooleanExtra("proxy_autotest", false)) {
+                        testProxy(false, false);
+                    }
+                });
             }
         }
     }
 
-    @Override
-    protected void onDestroy() {
-        if (testWebView != null) {
-            testWebView.destroy();
-            testWebView = null;
+    private static TextWatcher watcher(Runnable changed) {
+        return new TextWatcher() {
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+            public void onTextChanged(CharSequence s, int start, int before, int count) {}
+            public void afterTextChanged(Editable text) { changed.run(); }
+        };
+    }
+
+    @Override protected void onStart() { super.onStart(); active = true; }
+    @Override protected void onStop() {
+        active = false;
+        ++detectGeneration;
+        detecting = false;
+        if (probe != null) {
+            probe.cancel();
+            if (testing) {
+                setTesting(false);
+                testStatus.setText("测活已取消，请重新测试");
+            }
+            detectBtn.setEnabled(true);
         }
-        handler.removeCallbacksAndMessages(null);
-        // 恢复当前账号的代理（测活时临时改过全局代理）
-        Account cur = store.findById(store.getCurrentId());
-        ProxyHelper.apply(cur != null ? cur.proxy : "");
+        super.onStop();
+    }
+    @Override protected void onDestroy() {
+        if (probe != null) probe.cancel();
         super.onDestroy();
     }
 
     private void updateTile() {
-        String av = avatarInput.getText().toString().trim();
-        if (av.length() > 2) av = av.substring(0, 2);
-        tile.setText(av.isEmpty() ? "m" : av);
+        String text = TextRules.limit(avatarInput.getText().toString().trim(), 2);
+        tile.setText(text.isEmpty() ? "m" : text);
     }
 
     private void save() {
-        persist();
-        finish();
+        if (testing || detecting) return;
+        try {
+            String proxy = ProxySpec.parse(proxyInput.getText().toString()).value;
+            String previous;
+            try { previous = ProxySpec.parse(account.proxy).value; }
+            catch (IllegalArgumentException e) { previous = account.proxy; }
+            if (proxy.isEmpty() || proxy.equals(previous) || proxy.equals(testedProxy)) persist(proxy, true);
+            else testProxy(true, true);
+        } catch (IllegalArgumentException e) { testStatus.setText(e.getMessage()); }
     }
 
-    /** 读取输入并写入 store（不退出页面，供测活通过后自动入库复用） */
-    private void persist() {
-        String avatar = avatarInput.getText().toString().trim();
-        if (avatar.isEmpty()) avatar = "m";
-        if (avatar.length() > 2) avatar = avatar.substring(0, 2);
-        account.avatar = avatar;
-
-        String name = nameInput.getText().toString().trim();
-        if (!name.isEmpty()) {
-            account.name = name.length() > 16 ? name.substring(0, 16) : name;
+    private void persist(String proxy, boolean close) {
+        // 只更新此账号，重新读取其他账号的最新记录，避免配置页旧快照覆盖变更。
+        try {
+            store.reload();
+            Account latest = store.findById(account.id);
+            if (latest == null) { finish(); return; }
+            latest.avatar = TextRules.limit(avatarInput.getText().toString().trim(), 2);
+            if (latest.avatar.isEmpty()) latest.avatar = "m";
+            String name = TextRules.limit(nameInput.getText().toString().trim(), 16);
+            if (!name.isEmpty()) latest.name = name;
+            latest.proxy = proxy;
+            List<String> tags = new ArrayList<>();
+            for (String input : tagsInput.getText().toString().split("[,，]")) {
+                String tag = TextRules.limit(input.trim(), 8);
+                if (!tag.isEmpty() && !tags.contains(tag)) tags.add(tag);
+            }
+            latest.tags = tags;
+            store.save();
+            account = latest;
+            setResult(RESULT_OK);
+            testStatus.setText(R.string.config_proxy_saved);
+            if (close) finish();
+        } catch (RuntimeException e) {
+            testStatus.setText("保存失败，请检查可用存储空间后重试");
         }
-
-        account.proxy = proxyInput.getText().toString().trim();
-
-        List<String> tags = new ArrayList<>();
-        for (String t : tagsInput.getText().toString().split("[,，]")) {
-            String tag = t.trim();
-            if (!tag.isEmpty()) tags.add(tag.length() > 8 ? tag.substring(0, 8) : tag);
-        }
-        account.tags = tags;
-
-        store.save();
-        setResult(RESULT_OK);
     }
 
-    // ---------- 代理测活 ----------
+    private void setTesting(boolean value) {
+        testing = value;
+        avatarInput.setEnabled(!value);
+        nameInput.setEnabled(!value);
+        proxyInput.setEnabled(!value);
+        tagsInput.setEnabled(!value);
+        saveBtn.setEnabled(!value);
+        testBtn.setEnabled(!value);
+        detectBtn.setEnabled(!value && !detecting);
+        testBtn.setText(value ? R.string.config_proxy_testing : R.string.config_proxy_test);
+    }
 
-    private void testProxy() {
-        if (testing) return;
-        final String proxy = proxyInput.getText().toString().trim();
-        if (proxy.isEmpty()) {
-            testStatus.setText(R.string.config_proxy_empty);
-            return;
-        }
-        testing = true;
-        testBtn.setEnabled(false);
-        testBtn.setText(R.string.config_proxy_testing);
-        testStatus.setText("");
-
-        // 临时应用被测代理
-        ProxyHelper.apply(proxy);
-        testCreds = parseProxyCreds(proxy);
-        final long start = SystemClock.uptimeMillis();
-
-        testWebView = new WebView(this);
-        testWebView.setWebViewClient(new WebViewClient() {
-            @Override
-            public void onPageFinished(WebView v, String url) {
-                finishTest(true, null, SystemClock.uptimeMillis() - start);
-            }
-
-            @Override
-            public void onReceivedError(WebView v, WebResourceRequest request,
-                                        WebResourceError error) {
-                if (request.isForMainFrame()) {
-                    finishTest(false, String.valueOf(error.getDescription()), 0);
-                }
-            }
-
-            @Override
-            public void onReceivedHttpAuthRequest(WebView v, HttpAuthHandler handler,
-                                                  String host, String realm) {
-                // 代理 407 挑战：用 URL 内嵌账密应答（ProxyConfig 不支持内嵌凭证时的兜底）
-                if (testCreds != null) {
-                    handler.proceed(testCreds[0], testCreds[1]);
-                } else {
-                    handler.cancel();
-                }
+    private void testProxy(boolean saveAfter, boolean closeAfter) {
+        if (testing || detecting || !active) return;
+        final String candidate;
+        try { candidate = ProxySpec.parse(proxyInput.getText().toString()).value; }
+        catch (IllegalArgumentException e) { testStatus.setText(e.getMessage()); return; }
+        if (candidate.isEmpty()) { testStatus.setText(R.string.config_proxy_empty); return; }
+        setTesting(true);
+        testedProxy = null;
+        testStatus.setText("正在通过代理访问 muse.ai…");
+        probe.test(candidate, (ok, error, elapsed) -> {
+            if (!active || isFinishing() || isDestroyed()) return;
+            setTesting(false);
+            String current;
+            try { current = ProxySpec.parse(proxyInput.getText().toString()).value; }
+            catch (IllegalArgumentException e) { return; }
+            if (!candidate.equals(current)) return;
+            if (ok) {
+                testedProxy = candidate;
+                testStatus.setText(getString(R.string.config_proxy_ok) + "（" + elapsed + " ms）");
+                if (saveAfter) persist(candidate, closeAfter);
+            } else {
+                testedProxy = null;
+                testStatus.setText(getString(R.string.config_proxy_fail) + error);
             }
         });
-        timeoutRunnable = () -> finishTest(false, null, 0);
-        handler.postDelayed(timeoutRunnable, TEST_TIMEOUT_MS);
-        testWebView.loadUrl(TEST_URL);
     }
-
-    /** 从代理地址解析 [user, pass]，无凭证返回 null */
-    private static String[] parseProxyCreds(String p) {
-        int at = p.indexOf('@');
-        if (at < 0) return null;
-        String head = p.substring(0, at);
-        int si = head.indexOf("://");
-        String creds = si >= 0 ? head.substring(si + 3) : head;
-        if (creds.isEmpty()) return null;
-        int c = creds.indexOf(':');
-        if (c < 0) return new String[]{creds, ""};
-        return new String[]{creds.substring(0, c), creds.substring(c + 1)};
-    }
-
-    // ---------- Clash 端口探测 ----------
 
     private void detectProxy() {
-        if (detecting) return;
+        if (detecting || testing) return;
         detecting = true;
+        int token = ++detectGeneration;
         detectBtn.setEnabled(false);
         testStatus.setText(R.string.config_proxy_detecting);
         new Thread(() -> {
-            int port = probeLocalProxy();
+            int found = 0;
+            for (int port : CLASH_PORTS) {
+                try (Socket socket = new Socket()) {
+                    socket.connect(new InetSocketAddress("127.0.0.1", port), 400);
+                    found = port;
+                    break;
+                } catch (Exception ignored) { }
+            }
+            final int port = found;
             runOnUiThread(() -> {
+                if (!active || token != detectGeneration || isDestroyed()) return;
                 detecting = false;
                 detectBtn.setEnabled(true);
                 if (port > 0) {
-                    proxyInput.setText(proxyUrlForPort(port));
+                    proxyInput.setText((port == 7892 ? "socks5://" : "http://") + "127.0.0.1:" + port);
                     testStatus.setText(getString(R.string.config_proxy_detect_found, port));
-                } else {
-                    testStatus.setText(R.string.config_proxy_detect_none);
-                }
+                } else testStatus.setText(R.string.config_proxy_detect_none);
             });
-        }).start();
-    }
-
-    /** 探测本机 Clash 默认端口，返回首个在监听的端口，未找到返回 0 */
-    private static int probeLocalProxy() {
-        for (int p : CLASH_PORTS) {
-            try (Socket s = new Socket()) {
-                s.connect(new InetSocketAddress("127.0.0.1", p), PROBE_TIMEOUT_MS);
-                return p;
-            } catch (Exception ignored) {
-            }
-        }
-        return 0;
-    }
-
-    private static String proxyUrlForPort(int port) {
-        // 7892 是纯 SOCKS，其余按 HTTP 混合端口处理
-        return (port == 7892 ? "socks5://" : "http://") + "127.0.0.1:" + port;
-    }
-
-    private void finishTest(boolean ok, String err, long ms) {
-        if (!testing) return;
-        testing = false;
-        handler.removeCallbacks(timeoutRunnable);
-        if (testWebView != null) {
-            testWebView.destroy();
-            testWebView = null;
-        }
-        testBtn.setEnabled(true);
-        testBtn.setText(R.string.config_proxy_test);
-        if (ok) {
-            testStatus.setText(getString(R.string.config_proxy_ok) + "（" + ms + " ms）");
-            if (pendingSave) {
-                pendingSave = false;
-                persist();
-                testStatus.setText(getString(R.string.config_proxy_saved)
-                        + " · " + getString(R.string.config_proxy_ok) + "（" + ms + " ms）");
-            }
-        } else if (err == null) {
-            testStatus.setText(R.string.config_proxy_timeout);
-        } else {
-            testStatus.setText(getString(R.string.config_proxy_fail) + err);
-        }
+        }, "proxy-port-probe").start();
     }
 }

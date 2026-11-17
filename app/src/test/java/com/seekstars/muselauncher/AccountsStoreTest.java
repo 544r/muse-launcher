@@ -156,13 +156,16 @@ public class AccountsStoreTest {
 
     /** list 为合法数组但其中一条损坏 → 跳过坏条目，不算损坏事件 */
     @Test
-    public void partialCorruption_noNotice() {
+    public void partialCorruption_preservesOriginalAndNotifies() {
         FakeKv kv = new FakeKv();
         kv.putString("list", "[{\"id\":2,\"name\":\"好的\"},{\"id\":\"x\"}]");
         AccountsStore s = new AccountsStore(kv);
-        assertNull(s.takeLoadNotice());
+        assertEquals("partial", s.takeLoadNotice());
         assertEquals(1, s.all().size());
         assertEquals("好的", s.all().get(0).name);
+        s.save();
+        s.save();
+        assertTrue(kv.getString("list_corrupt", "").contains("x"));
     }
 
     /** 滚动备份：第二次 save 后 list_prev 应是第一次的 list 值 */
@@ -236,5 +239,85 @@ public class AccountsStoreTest {
         s.reload();
         assertEquals("recovered", s.takeLoadNotice());
         assertEquals(1, s.all().size());
+    }
+    @Test
+    public void missingOrStaleNextIdCannotReuseProfiles() {
+        FakeKv kv = new FakeKv();
+        kv.putString("list", "[{\"id\":7,\"name\":\"existing\"}]");
+        AccountsStore store = new AccountsStore(kv);
+        assertEquals(8L, store.addDefault().id);
+        kv.putLong("nextId", 1L);
+        store.reload();
+        assertEquals(9L, store.addDefault().id);
+        store.reserveProfileIds(java.util.Arrays.asList("Default", "acct_50", "acct_bad"));
+        assertEquals(51L, store.addDefault().id);
+    }
+
+    @Test
+    public void duplicateAndInvalidIdsAreQuarantined() {
+        FakeKv kv = new FakeKv();
+        kv.putString("list", "[{\"id\":2,\"name\":\"first\"},{\"id\":2,\"name\":\"duplicate\"},"
+                + "{\"id\":-1,\"name\":\"invalid\"},{\"id\":25}]");
+        AccountsStore store = new AccountsStore(kv);
+        assertEquals("partial", store.takeLoadNotice());
+        assertEquals(1, store.all().size());
+        assertEquals(26L, store.addDefault().id);
+    }
+
+    @Test
+    public void deletionQueueSurvivesReloadAndScrubsBackups() {
+        FakeKv kv = new FakeKv();
+        AccountsStore store = new AccountsStore(kv);
+        Account a = store.addDefault("http://user:secret@localhost:8080");
+        store.save();
+        kv.putString("list_corrupt", "secret");
+        store.remove(a.id);
+        assertTrue(store.pendingDeletionIds().contains(a.id));
+        assertEquals("", kv.getString("list_corrupt", ""));
+        assertEquals("[]", kv.getString("list_prev", ""));
+        AccountsStore reloaded = new AccountsStore(kv);
+        assertTrue(reloaded.pendingDeletionIds().contains(a.id));
+        reloaded.completeDeletion(a.id);
+        assertTrue(new AccountsStore(kv).pendingDeletionIds().isEmpty());
+    }
+
+    @Test
+    public void deletedAccountCannotReturnFromStaleBackup() {
+        FakeKv kv = new FakeKv();
+        AccountsStore store = new AccountsStore(kv);
+        Account a = store.addDefault();
+        String old = kv.getString("list", "");
+        store.remove(a.id);
+        kv.putString("list", "broken");
+        kv.putString("list_prev", old);
+        assertTrue(new AccountsStore(kv).all().isEmpty());
+    }
+
+    @Test(expected = IllegalStateException.class)
+    public void exhaustedIdsCannotWrapToNegative() {
+        FakeKv kv = new FakeKv();
+        kv.putLong("nextId", Long.MAX_VALUE);
+        new AccountsStore(kv).addDefault();
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void listSnapshotCannotBeMutated() {
+        AccountsStore store = new AccountsStore(new FakeKv());
+        store.addDefault();
+        store.all().clear();
+    }
+
+    @Test
+    public void failedWriteDoesNotInventAnAccount() {
+        FakeKv kv = new FakeKv() {
+            @Override public void putAll(Map<String, Object> values) {
+                throw new IllegalStateException("disk full");
+            }
+        };
+        AccountsStore store = new AccountsStore(kv);
+        try { store.addDefault(); org.junit.Assert.fail(); }
+        catch (IllegalStateException expected) { }
+        assertTrue(store.all().isEmpty());
+        assertEquals(-1L, store.getCurrentId());
     }
 }

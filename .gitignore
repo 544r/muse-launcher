@@ -9,6 +9,9 @@ captures/
 
 # Machine-specific
 local.properties
+*.jks
+*.keystore
+signing.properties
 
 # Build outputs (APK 通过 GitHub Releases 分发，不进仓库)
 *.apk

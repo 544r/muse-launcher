@@ -31,6 +31,7 @@ public class SharedPreferencesStore implements KeyValueStore {
 
     @Override
     public void putAll(Map<String, Object> values) {
+        Map<String, ?> before = prefs.getAll();
         SharedPreferences.Editor e = prefs.edit();
         for (Map.Entry<String, Object> en : values.entrySet()) {
             Object v = en.getValue();
@@ -38,7 +39,19 @@ public class SharedPreferencesStore implements KeyValueStore {
             else if (v instanceof Boolean) e.putBoolean(en.getKey(), (Boolean) v);
             else if (v instanceof String) e.putString(en.getKey(), (String) v);
         }
-        e.apply();
+        if (!e.commit()) {
+            // commit 失败仍会改变 SharedPreferences 的进程内缓存，恢复这次涉及的键。
+            SharedPreferences.Editor rollback = prefs.edit();
+            for (String key : values.keySet()) {
+                Object old = before.get(key);
+                if (old instanceof Long) rollback.putLong(key, (Long) old);
+                else if (old instanceof Boolean) rollback.putBoolean(key, (Boolean) old);
+                else if (old instanceof String) rollback.putString(key, (String) old);
+                else rollback.remove(key);
+            }
+            rollback.commit();
+            throw new IllegalStateException("账号数据写入失败");
+        }
     }
 
     @Override
