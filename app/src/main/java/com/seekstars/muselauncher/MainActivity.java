@@ -2,7 +2,6 @@ package com.seekstars.muselauncher;
 
 import android.app.DownloadManager;
 import android.content.Intent;
-import android.content.res.ColorStateList;
 import android.graphics.Typeface;
 import android.net.Uri;
 import android.os.Bundle;
@@ -11,10 +10,7 @@ import android.os.Looper;
 import android.os.SystemClock;
 import android.text.Editable;
 import android.text.InputType;
-import android.text.SpannableString;
-import android.text.Spanned;
 import android.text.TextWatcher;
-import android.text.style.ForegroundColorSpan;
 import android.util.Log;
 import android.util.LongSparseArray;
 import android.webkit.HttpAuthHandler;
@@ -36,8 +32,6 @@ import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
 import android.widget.EditText;
 import android.widget.FrameLayout;
-import android.widget.ImageButton;
-import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -47,6 +41,8 @@ import java.util.Map;
 
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.appcompat.widget.PopupMenu;
+import android.view.inputmethod.InputMethodManager;
 import androidx.drawerlayout.widget.DrawerLayout;
 import androidx.webkit.Profile;
 import androidx.webkit.ProfileStore;
@@ -60,9 +56,6 @@ public class MainActivity extends AppCompatActivity {
     private static final int REQ_CONFIG = 10002;
     private static final long MIN_SPLASH_MS = 150;
     private static final long SPLASH_TIMEOUT_MS = 8000;
-    private static final int COLOR_TEXT = 0xFFE9EBEE;
-    private static final int COLOR_MUTED = 0xFF8A9099;
-    private static final int COLOR_ICON = 0xFF7D838C;
     /** muse.ai 登录会话 cookie（httpOnly）。匿名访问只会落下 hatch_native_auth_* 等流程 cookie。 */
 
 
@@ -101,9 +94,6 @@ public class MainActivity extends AppCompatActivity {
     private final LongSparseArray<Long> loadStartAt = new LongSparseArray<>();
     private WebView currentWebView;
 
-    private long editId = -1;
-    private long confirmDelId = -1;
-    private EditText renameInput;
     private long splashShownAt;
     private final Runnable hideSplashRunnable = this::hideSplash;
     private final FileSelection fileSelection = new FileSelection();
@@ -151,6 +141,17 @@ public class MainActivity extends AppCompatActivity {
 
         drawerLayout = findViewById(R.id.drawerLayout);
         drawerContent = findViewById(R.id.drawerContent);
+        drawerLayout.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
+            int width = Math.min(dp(360), Math.max(0, r - l - dp(64)));
+            if (width > 0 && drawerContent.getLayoutParams().width != width) {
+                ViewGroup.LayoutParams params = drawerContent.getLayoutParams();
+                params.width = width;
+                drawerContent.setLayoutParams(params);
+            }
+        });
+        drawerLayout.addDrawerListener(new DrawerLayout.SimpleDrawerListener() {
+            @Override public void onDrawerClosed(View drawer) { dismissSearchKeyboard(); }
+        });
         rail = findViewById(R.id.rail);
         edgeSwipe = findViewById(R.id.edgeSwipe);
         railAvatars = findViewById(R.id.railAvatars);
@@ -181,6 +182,16 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
+        findViewById(R.id.btnErrorConfig).setOnClickListener(v -> {
+            if (store.getCurrentId() > 0) openConfig(store.getCurrentId());
+        });
+        findViewById(R.id.searchClear).setOnClickListener(v -> searchInput.setText(""));
+        searchInput.setOnEditorActionListener((v, actionId, event) -> {
+            if (actionId != EditorInfo.IME_ACTION_SEARCH) return false;
+            dismissSearchKeyboard();
+            return true;
+        });
+
         // 搜索框：输入即时按名称 + 标签过滤
         searchInput.addTextChangedListener(new TextWatcher() {
             @Override
@@ -193,6 +204,8 @@ public class MainActivity extends AppCompatActivity {
 
             @Override
             public void afterTextChanged(Editable s) {
+                findViewById(R.id.searchClear).setVisibility(s.length() == 0 ? View.GONE : View.VISIBLE);
+                searchInput.setPaddingRelative(dp(40), dp(11), dp(s.length() == 0 ? 12 : 48), dp(11));
                 mainHandler.removeCallbacks(renderAccountsRunnable);
                 mainHandler.postDelayed(renderAccountsRunnable, 100);
             }
@@ -683,8 +696,6 @@ public class MainActivity extends AppCompatActivity {
         final Account a;
         try { a = store.addDefault(prev != null ? prev.proxy : null); }
         catch (RuntimeException e) { toast("创建账号失败，请检查可用存储空间"); return; }
-        editId = -1;
-        confirmDelId = -1;
         switchTo(a.id, true);
         toast(getString(R.string.toast_created, a.name));
     }
@@ -746,23 +757,67 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
-    private void commitRename(long id) {
-        Account a = store.findById(id);
-        editId = -1;
-        if (a == null) {
-            renderAccounts();
-            return;
-        }
-        String name = renameInput != null ? renameInput.getText().toString().trim() : "";
-        name = TextRules.limit(name, 16);
-        if (name.isEmpty() || name.equals(a.name)) {
-            renderAccounts();
-            return;
-        }
-        try { store.rename(id, name); }
-        catch (RuntimeException e) { toast("保存失败，请检查可用存储空间"); return; }
-        renderAccounts();
-        toast(getString(R.string.toast_renamed, name));
+    private void showAccountMenu(View anchor, Account account) {
+        PopupMenu menu = new PopupMenu(this, anchor);
+        menu.getMenu().add(0, 1, 0, R.string.cd_config);
+        menu.getMenu().add(0, 2, 1, R.string.cd_rename);
+        menu.getMenu().add(0, 3, 2, R.string.cd_delete);
+        menu.setOnMenuItemClickListener(item -> {
+            if (item.getItemId() == 1) openConfig(account.id);
+            else if (item.getItemId() == 2) showRenameDialog(account);
+            else new AlertDialog.Builder(this).setTitle(R.string.cd_delete)
+                    .setMessage(getString(R.string.confirm_delete_fmt, account.name))
+                    .setNegativeButton(R.string.btn_cancel, null)
+                    .setPositiveButton(R.string.btn_delete, (dialog, which) -> deleteAccount(account.id))
+                    .show();
+            return true;
+        });
+        menu.show();
+    }
+
+    private void showRenameDialog(Account account) {
+        EditText input = new EditText(this);
+        input.setSingleLine(true);
+        input.setText(account.name);
+        input.setHint(R.string.rename_hint);
+        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+        input.setImeOptions(EditorInfo.IME_ACTION_DONE);
+        input.setMinHeight(dp(52));
+        input.setPadding(dp(14), dp(12), dp(14), dp(12));
+        FrameLayout container = new FrameLayout(this);
+        container.setPadding(dp(24), dp(8), dp(24), 0);
+        container.addView(input);
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle(R.string.cd_rename)
+                .setView(container).setNegativeButton(R.string.btn_cancel, null)
+                .setPositiveButton(R.string.config_save, null).create();
+        dialog.setOnShowListener(ignored -> {
+            View.OnClickListener save = v -> {
+                String name = TextRules.limit(input.getText().toString().trim(), 16);
+                if (name.isEmpty()) { input.setError(getString(R.string.rename_hint)); return; }
+                if (store.findById(account.id) == null) { dialog.dismiss(); return; }
+                try { store.rename(account.id, name); }
+                catch (RuntimeException e) { input.setError(getString(R.string.config_save_failed)); return; }
+                renderAccounts();
+                toast(getString(R.string.toast_renamed, name));
+                dialog.dismiss();
+            };
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(save);
+            input.setOnEditorActionListener((v, actionId, event) -> {
+                if (actionId != EditorInfo.IME_ACTION_DONE) return false;
+                save.onClick(v);
+                return true;
+            });
+            input.requestFocus();
+            input.selectAll();
+        });
+        dialog.show();
+    }
+
+    private void dismissSearchKeyboard() {
+        if (searchInput == null) return;
+        searchInput.clearFocus();
+        InputMethodManager keyboard = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+        if (keyboard != null) keyboard.hideSoftInputFromWindow(searchInput.getWindowToken(), 0);
     }
 
     private void deleteAccount(long id) {
@@ -777,8 +832,6 @@ public class MainActivity extends AppCompatActivity {
         freezePages();
         destroyWebView(id, webViews.remove(id));
         processPendingDeletes();
-        editId = -1;
-        confirmDelId = -1;
         renderAccounts();
         hideSplash();
         hideErrorOverlay();
@@ -843,7 +896,7 @@ public class MainActivity extends AppCompatActivity {
             }
         }
         probeIndex = end;
-        if (probeChanged && editId == -1 && confirmDelId == -1) {
+        if (probeChanged) {
             renderAccounts();
             probeChanged = false;
         }
@@ -868,7 +921,8 @@ public class MainActivity extends AppCompatActivity {
             railAvatars.addView(makeRailAvatar(a));
             accountList.addView(makeDrawerRow(a));
         }
-        accCount.setText(getString(R.string.accounts_count_fmt, store.all().size()));
+        accCount.setText(q.isEmpty() ? getString(R.string.accounts_count_fmt, store.all().size())
+                : getString(R.string.search_results_fmt, shown, store.all().size()));
         emptyState.setVisibility(store.all().isEmpty() ? View.VISIBLE : View.GONE);
         drawerEmpty.setVisibility(!q.isEmpty() && shown == 0 ? View.VISIBLE : View.GONE);
     }
@@ -890,6 +944,8 @@ public class MainActivity extends AppCompatActivity {
 
     private void showSplashFor(Account a) {
         splashName.setText(a.name);
+        ((TextView) findViewById(R.id.splashTile)).setText(
+                a.avatar == null || a.avatar.isEmpty() ? "m" : a.avatar);
         splash.setVisibility(View.VISIBLE);
         splashShownAt = SystemClock.uptimeMillis();
         webContainer.removeCallbacks(hideSplashRunnable);
@@ -910,7 +966,7 @@ public class MainActivity extends AppCompatActivity {
 
     private View makeRailAvatar(Account a) {
         FrameLayout wrap = new FrameLayout(this);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(40), dp(40));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(48), dp(48));
         lp.topMargin = dp(4);
         lp.bottomMargin = dp(4);
         wrap.setLayoutParams(lp);
@@ -930,136 +986,15 @@ public class MainActivity extends AppCompatActivity {
 
         wrap.setContentDescription(a.name + "，" + getString(a.logged ? R.string.status_logged : R.string.status_not_logged));
         wrap.setSelected(a.id == store.getCurrentId());
+        wrap.setFocusable(true);
+        wrap.setTooltipText(a.name);
         wrap.setOnClickListener(v -> switchTo(a.id, true));
         return wrap;
     }
 
     private View makeDrawerRow(Account a) {
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(dp(10), dp(9), dp(10), dp(9));
-        LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        rlp.bottomMargin = dp(4);
-        row.setLayoutParams(rlp);
-
-        // 删除确认态
-        if (confirmDelId == a.id) {
-            row.setBackgroundResource(R.drawable.bg_row);
-            TextView msg = new TextView(this);
-            msg.setText(getString(R.string.confirm_delete_fmt, a.name));
-            msg.setTextColor(COLOR_TEXT);
-            msg.setTextSize(12.5f);
-            msg.setLineSpacing(dp(2), 1f);
-            row.addView(msg, new LinearLayout.LayoutParams(0,
-                    ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-            row.addView(makeTextBtn(getString(R.string.btn_delete), true,
-                    v -> deleteAccount(a.id)));
-            row.addView(makeTextBtn(getString(R.string.btn_cancel), false,
-                    v -> {
-                        confirmDelId = -1;
-                        renderAccounts();
-                    }));
-            return row;
-        }
-
-        // 重命名编辑态
-        if (editId == a.id) {
-            row.setBackgroundResource(R.drawable.bg_row);
-            row.addView(makeTile(dp(40), 20, a.avatar));
-
-            EditText input = new EditText(this);
-            input.setText(a.name);
-            input.setTextColor(COLOR_TEXT);
-            input.setHintTextColor(0xFF686E78);
-            input.setHint(R.string.rename_hint);
-            input.setTextSize(13.5f);
-            input.setBackgroundResource(R.drawable.bg_rename);
-            input.setSingleLine(true);
-            input.setInputType(InputType.TYPE_CLASS_TEXT);
-            input.setImeOptions(EditorInfo.IME_ACTION_DONE);
-            input.setPadding(dp(10), dp(7), dp(10), dp(7));
-            LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(0,
-                    ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-            ilp.leftMargin = dp(8);
-            input.setLayoutParams(ilp);
-            input.setOnEditorActionListener((v, actionId, event) -> {
-                if (actionId == EditorInfo.IME_ACTION_DONE) {
-                    commitRename(a.id);
-                    return true;
-                }
-                return false;
-            });
-            row.addView(input);
-            renameInput = input;
-
-            row.addView(makeIconBtn(R.drawable.ic_check, 0xFFFFFFFF, R.drawable.bg_editbtn_ok,
-                    getString(R.string.cd_rename), v -> commitRename(a.id)));
-            row.addView(makeIconBtn(R.drawable.ic_close, COLOR_ICON, R.drawable.bg_editbtn,
-                    getString(R.string.btn_cancel), v -> {
-                        editId = -1;
-                        renderAccounts();
-                    }));
-            row.post(() -> {
-                input.requestFocus();
-                input.selectAll();
-            });
-            return row;
-        }
-
-        // 常规态
-        row.setBackgroundResource(a.id == store.getCurrentId()
-                ? R.drawable.bg_row_active : R.drawable.bg_row);
-        row.addView(makeTile(dp(40), 20, a.avatar));
-
-        LinearLayout info = new LinearLayout(this);
-        info.setOrientation(LinearLayout.VERTICAL);
-        LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(0,
-                ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-        ilp.leftMargin = dp(11);
-        info.setLayoutParams(ilp);
-
-        TextView name = new TextView(this);
-        name.setText(a.name);
-        name.setTextColor(COLOR_TEXT);
-        name.setTextSize(14.5f);
-        name.setTypeface(Typeface.DEFAULT_BOLD);
-        name.setMaxLines(1);
-        name.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        info.addView(name);
-
-        String status = getString(a.logged ? R.string.status_logged : R.string.status_not_logged);
-        SpannableString ss = new SpannableString("●  " + status);
-        ss.setSpan(new ForegroundColorSpan(a.logged ? 0xFF34C759 : 0xFF4A4F57),
-                0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-        TextView sub = new TextView(this);
-        sub.setText(ss);
-        sub.setTextColor(COLOR_MUTED);
-        sub.setTextSize(11.5f);
-        sub.setPadding(0, dp(3), 0, 0);
-        sub.setMaxLines(1);
-        sub.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        info.addView(sub);
-
-        row.addView(info);
-        row.addView(makeIconBtn(R.drawable.ic_settings, COLOR_ICON, R.drawable.bg_rail_btn,
-                getString(R.string.cd_config), v -> openConfig(a.id)));
-        row.addView(makeIconBtn(R.drawable.ic_pencil, COLOR_ICON, R.drawable.bg_rail_btn,
-                getString(R.string.cd_rename), v -> {
-                    editId = a.id;
-                    confirmDelId = -1;
-                    renderAccounts();
-                }));
-        row.addView(makeIconBtn(R.drawable.ic_trash, COLOR_ICON, R.drawable.bg_rail_btn,
-                getString(R.string.cd_delete), v -> {
-                    confirmDelId = a.id;
-                    editId = -1;
-                    renderAccounts();
-                }));
-
-        row.setOnClickListener(v -> switchTo(a.id, true));
-        return row;
+        return AccountRow.create(accountList, a, a.id == store.getCurrentId(),
+                v -> switchTo(a.id, true), v -> showAccountMenu(v, a));
     }
 
     private TextView makeTile(int sizePx, float textSp, String text) {
@@ -1073,38 +1008,6 @@ public class MainActivity extends AppCompatActivity {
         t.setIncludeFontPadding(false);
         t.setLayoutParams(new ViewGroup.LayoutParams(sizePx, sizePx));
         return t;
-    }
-
-    private ImageButton makeIconBtn(int icon, int tint, int bg, String cd,
-                                    View.OnClickListener onClick) {
-        ImageButton b = new ImageButton(this);
-        b.setImageResource(icon);
-        b.setImageTintList(ColorStateList.valueOf(tint));
-        b.setBackgroundResource(bg);
-        b.setContentDescription(cd);
-        b.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
-        b.setPadding(dp(6), dp(6), dp(6), dp(6));
-        b.setOnClickListener(onClick);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(30), dp(30));
-        lp.leftMargin = dp(6);
-        b.setLayoutParams(lp);
-        return b;
-    }
-
-    private TextView makeTextBtn(String text, boolean danger, View.OnClickListener onClick) {
-        TextView b = new TextView(this);
-        b.setText(text);
-        b.setTextColor(0xFFFFFFFF);
-        b.setTextSize(12);
-        b.setGravity(Gravity.CENTER);
-        b.setBackgroundResource(danger ? R.drawable.bg_delbtn_ok : R.drawable.bg_editbtn);
-        b.setPadding(dp(10), dp(6), dp(10), dp(6));
-        b.setOnClickListener(onClick);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        lp.leftMargin = dp(6);
-        b.setLayoutParams(lp);
-        return b;
     }
 
     // ---------- 其他 ----------

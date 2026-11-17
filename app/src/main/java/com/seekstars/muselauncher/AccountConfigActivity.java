@@ -21,7 +21,8 @@ public class AccountConfigActivity extends AppCompatActivity {
     private Account account;
     private TextView tile, detectBtn, testBtn, testStatus;
     private EditText avatarInput, nameInput, proxyInput, tagsInput;
-    private View saveBtn;
+    private TextView saveBtn;
+    private View statusBox, progress;
     private ProxyProbeClient probe;
     private boolean testing;
     private boolean detecting;
@@ -32,6 +33,7 @@ public class AccountConfigActivity extends AppCompatActivity {
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_config);
+        findViewById(R.id.configRoot).requestFocus();
         try {
             store = new AccountsStore(this);
             account = store.findById(getIntent().getLongExtra("account_id", -1L));
@@ -50,7 +52,10 @@ public class AccountConfigActivity extends AppCompatActivity {
         detectBtn = findViewById(R.id.cfgProxyDetect);
         testBtn = findViewById(R.id.cfgProxyTest);
         testStatus = findViewById(R.id.cfgProxyStatus);
+        statusBox = findViewById(R.id.cfgStatusBox);
+        progress = findViewById(R.id.cfgProxyProgress);
         saveBtn = findViewById(R.id.cfgSave);
+        ((TextView) findViewById(R.id.cfgAccountName)).setText(account.name);
         findViewById(R.id.cfgBack).setOnClickListener(v -> finish());
         saveBtn.setOnClickListener(v -> save());
         testBtn.setOnClickListener(v -> testProxy(false, false));
@@ -67,7 +72,7 @@ public class AccountConfigActivity extends AppCompatActivity {
                 probe.cancel();
                 setTesting(false);
             }
-            testStatus.setText("");
+            showStatus("", R.color.text_muted);
         }));
         if (BuildConfig.DEBUG && savedInstanceState == null) {
             String preset = getIntent().getStringExtra("proxy_preset");
@@ -98,14 +103,17 @@ public class AccountConfigActivity extends AppCompatActivity {
     @Override protected void onStop() {
         active = false;
         ++detectGeneration;
+        boolean wasDetecting = detecting;
         detecting = false;
         if (probe != null) {
             probe.cancel();
             if (testing) {
                 setTesting(false);
-                testStatus.setText("测活已取消，请重新测试");
+                showStatus(getString(R.string.config_proxy_cancelled), R.color.text_muted);
+            } else if (wasDetecting) {
+                showStatus(getString(R.string.config_proxy_cancelled), R.color.text_muted);
             }
-            detectBtn.setEnabled(true);
+            updateBusyViews();
         }
         super.onStop();
     }
@@ -128,7 +136,7 @@ public class AccountConfigActivity extends AppCompatActivity {
             catch (IllegalArgumentException e) { previous = account.proxy; }
             if (proxy.isEmpty() || proxy.equals(previous) || proxy.equals(testedProxy)) persist(proxy, true);
             else testProxy(true, true);
-        } catch (IllegalArgumentException e) { testStatus.setText(e.getMessage()); }
+        } catch (IllegalArgumentException e) { showStatus(e.getMessage(), R.color.error); }
     }
 
     private void persist(String proxy, boolean close) {
@@ -151,34 +159,52 @@ public class AccountConfigActivity extends AppCompatActivity {
             store.save();
             account = latest;
             setResult(RESULT_OK);
-            testStatus.setText(R.string.config_proxy_saved);
+            showStatus(getString(R.string.config_proxy_saved), R.color.green);
             if (close) finish();
         } catch (RuntimeException e) {
-            testStatus.setText("保存失败，请检查可用存储空间后重试");
+            showStatus(getString(R.string.config_save_failed), R.color.error);
         }
     }
 
     private void setTesting(boolean value) {
         testing = value;
-        avatarInput.setEnabled(!value);
-        nameInput.setEnabled(!value);
-        proxyInput.setEnabled(!value);
-        tagsInput.setEnabled(!value);
-        saveBtn.setEnabled(!value);
-        testBtn.setEnabled(!value);
-        detectBtn.setEnabled(!value && !detecting);
-        testBtn.setText(value ? R.string.config_proxy_testing : R.string.config_proxy_test);
+        updateBusyViews();
+    }
+
+    private void updateBusyViews() {
+        boolean busy = testing || detecting;
+        for (View field : new View[]{avatarInput, nameInput, proxyInput, tagsInput}) {
+            field.setEnabled(!busy);
+            field.setAlpha(busy ? 0.6f : 1f);
+        }
+        saveBtn.setEnabled(!busy);
+        testBtn.setEnabled(!busy);
+        detectBtn.setEnabled(!busy);
+        testBtn.setText(testing ? R.string.config_proxy_testing : R.string.config_proxy_test);
+        saveBtn.setText(busy ? R.string.config_busy : R.string.config_save);
+        progress.setVisibility(busy ? View.VISIBLE : View.GONE);
+    }
+
+    private void showStatus(CharSequence message, int color) {
+        testStatus.setText(message);
+        testStatus.setTextColor(getColor(color));
+        statusBox.setVisibility(TextUtils.isEmpty(message) ? View.GONE : View.VISIBLE);
+        if (!TextUtils.isEmpty(message)) statusBox.post(() -> {
+            if (!active || isFinishing()) return;
+            statusBox.requestRectangleOnScreen(new android.graphics.Rect(
+                    0, 0, statusBox.getWidth(), statusBox.getHeight()), false);
+        });
     }
 
     private void testProxy(boolean saveAfter, boolean closeAfter) {
         if (testing || detecting || !active) return;
         final String candidate;
         try { candidate = ProxySpec.parse(proxyInput.getText().toString()).value; }
-        catch (IllegalArgumentException e) { testStatus.setText(e.getMessage()); return; }
-        if (candidate.isEmpty()) { testStatus.setText(R.string.config_proxy_empty); return; }
+        catch (IllegalArgumentException e) { showStatus(e.getMessage(), R.color.error); return; }
+        if (candidate.isEmpty()) { showStatus(getString(R.string.config_proxy_empty), R.color.text_muted); return; }
         setTesting(true);
         testedProxy = null;
-        testStatus.setText("正在通过代理访问 muse.ai…");
+        showStatus(getString(R.string.config_proxy_connecting), R.color.text_muted);
         probe.test(candidate, (ok, error, elapsed) -> {
             if (!active || isFinishing() || isDestroyed()) return;
             setTesting(false);
@@ -188,11 +214,11 @@ public class AccountConfigActivity extends AppCompatActivity {
             if (!candidate.equals(current)) return;
             if (ok) {
                 testedProxy = candidate;
-                testStatus.setText(getString(R.string.config_proxy_ok) + "（" + elapsed + " ms）");
+                showStatus(getString(R.string.config_proxy_ok) + "（" + elapsed + " ms）", R.color.green);
                 if (saveAfter) persist(candidate, closeAfter);
             } else {
                 testedProxy = null;
-                testStatus.setText(getString(R.string.config_proxy_fail) + error);
+                showStatus(getString(R.string.config_proxy_fail) + error, R.color.error);
             }
         });
     }
@@ -201,8 +227,8 @@ public class AccountConfigActivity extends AppCompatActivity {
         if (detecting || testing) return;
         detecting = true;
         int token = ++detectGeneration;
-        detectBtn.setEnabled(false);
-        testStatus.setText(R.string.config_proxy_detecting);
+        updateBusyViews();
+        showStatus(getString(R.string.config_proxy_detecting), R.color.text_muted);
         new Thread(() -> {
             int found = 0;
             for (int port : CLASH_PORTS) {
@@ -216,11 +242,11 @@ public class AccountConfigActivity extends AppCompatActivity {
             runOnUiThread(() -> {
                 if (!active || token != detectGeneration || isDestroyed()) return;
                 detecting = false;
-                detectBtn.setEnabled(true);
+                updateBusyViews();
                 if (port > 0) {
                     proxyInput.setText((port == 7892 ? "socks5://" : "http://") + "127.0.0.1:" + port);
-                    testStatus.setText(getString(R.string.config_proxy_detect_found, port));
-                } else testStatus.setText(R.string.config_proxy_detect_none);
+                    showStatus(getString(R.string.config_proxy_detect_found, port), R.color.text_muted);
+                } else showStatus(getString(R.string.config_proxy_detect_none), R.color.text_muted);
             });
         }, "proxy-port-probe").start();
     }

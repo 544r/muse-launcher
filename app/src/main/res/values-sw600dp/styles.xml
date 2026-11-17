@@ -1,0 +1,5 @@
+<resources>
+    <style name="UiConfigContainer">
+        <item name="android:layout_width">560dp</item>
+    </style>
+</resources>

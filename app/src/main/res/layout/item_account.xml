@@ -1,0 +1,29 @@
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent" android:layout_height="wrap_content"
+    android:layout_marginBottom="8dp" android:orientation="horizontal"
+    android:gravity="center_vertical" android:padding="12dp" android:minHeight="88dp"
+    android:background="@drawable/bg_row" android:foreground="?attr/selectableItemBackground"
+    android:focusable="true" android:clickable="true">
+    <TextView android:id="@+id/accountAvatar" android:layout_width="40dp" android:layout_height="40dp"
+        android:background="@drawable/bg_mtile" android:gravity="center" android:textSize="20sp"
+        android:includeFontPadding="false" android:textColor="@color/m_blue" android:textStyle="bold|italic"
+        android:importantForAccessibility="no" />
+    <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content"
+        android:layout_weight="1" android:layout_marginStart="12dp" android:orientation="vertical">
+        <TextView android:id="@+id/accountCurrent" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:text="@string/account_current"
+            android:textColor="@color/blue" android:textSize="12sp" android:textStyle="bold"
+            android:layout_marginBottom="3dp" android:visibility="gone" />
+        <TextView android:id="@+id/accountName" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:textColor="@color/text_primary"
+            android:textSize="15sp" android:textStyle="bold" android:maxLines="2" android:ellipsize="end" />
+        <TextView android:id="@+id/accountStatus" style="@style/UiHint"
+            android:layout_marginTop="4dp" />
+        <TextView android:id="@+id/accountTags" style="@style/UiHint"
+            android:layout_marginTop="5dp" android:maxLines="2" android:ellipsize="end" android:visibility="gone" />
+    </LinearLayout>
+    <ImageButton android:id="@+id/accountOptions" android:layout_width="48dp" android:layout_height="48dp"
+        android:background="@drawable/bg_rail_btn" android:padding="12dp" android:layout_marginStart="4dp"
+        android:src="@drawable/ic_more" app:tint="@color/icon_gray" android:contentDescription="@string/cd_config" />
+</LinearLayout>

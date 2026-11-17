@@ -63,6 +63,8 @@ public class AccountConfigActivityTest {
         assertNotNull(request);
         assertEquals("", new AccountsStore(app).findById(accountId).proxy);
         assertFalse(activity.findViewById(R.id.cfgProxy).isEnabled());
+        assertEquals(android.view.View.VISIBLE, activity.findViewById(R.id.cfgProxyProgress).getVisibility());
+        assertFalse(activity.findViewById(R.id.cfgSave).isEnabled());
         reply(true);
         assertEquals("http://localhost:7890", new AccountsStore(app).findById(accountId).proxy);
         assertTrue(activity.isFinishing());
@@ -79,6 +81,8 @@ public class AccountConfigActivityTest {
         assertEquals("", new AccountsStore(app).findById(accountId).proxy);
         assertFalse(activity.isFinishing());
         assertTrue(activity.findViewById(R.id.cfgSave).isEnabled());
+        assertEquals(android.view.View.GONE, activity.findViewById(R.id.cfgProxyProgress).getVisibility());
+        assertEquals(android.view.View.VISIBLE, activity.findViewById(R.id.cfgStatusBox).getVisibility());
         controller.pause().stop().destroy();
     }
 
