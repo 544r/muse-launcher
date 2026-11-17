@@ -12,6 +12,16 @@ import java.util.Map;
 
 /** M3：AccountsStore 备份/自愈/通知逻辑（HashMap 假 KV，纯 JVM 测试） */
 public class AccountsStoreTest {
+    @Test public void reloadKeepsKnownRuntimeSessionButDoesNotPersistItAcrossInstances() {
+        FakeKv kv = new FakeKv();
+        AccountsStore store = new AccountsStore(kv);
+        Account account = store.addDefault();
+        account.logged = true;
+        store.save();
+        store.reload();
+        assertTrue(store.findById(account.id).logged);
+        org.junit.Assert.assertFalse(new AccountsStore(kv).findById(account.id).logged);
+    }
 
     /** 最小 HashMap 键值实现：putAll 覆盖写，模拟 SharedPreferences */
     static class FakeKv implements KeyValueStore {

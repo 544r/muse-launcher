@@ -51,6 +51,9 @@ public class AccountsStore {
         for (Account a : loaded) if (a.id == loadedCurrent) found = true;
         if (!found) loadedCurrent = loaded.isEmpty() ? -1 : loaded.get(0).id;
         // 读取与修复完成后才替换内存，读取失败不得清空账号。
+        Map<Long, Boolean> sessions = new HashMap<>();
+        for (Account account : accounts) sessions.put(account.id, account.logged);
+        for (Account account : loaded) account.logged = sessions.getOrDefault(account.id, false);
         accounts.clear();
         accounts.addAll(loaded);
         pendingDeletes.clear();

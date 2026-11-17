@@ -35,7 +35,6 @@ import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -74,6 +73,7 @@ public class MainActivity extends AppCompatActivity {
     private View edgeSwipe;
     private LinearLayout railAvatars;
     private LinearLayout accountList;
+    private AccountViews railViews, drawerViews;
     private EditText searchInput;
     private View drawerEmpty;
     private TextView accCount;
@@ -101,19 +101,11 @@ public class MainActivity extends AppCompatActivity {
     private float edgeStartX;
     private long edgeDownAt;
 
-    /** M4: 登录态分块探测。androidx Profile API 强制主线程调用，无法后台化；
-     *  改为主线程分块（每块 20 个账号，块间让出一帧），账号多时不阻塞 UI，脏标记合并请求 */
-    private static final int PROBE_CHUNK = 20;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private final java.util.concurrent.atomic.AtomicBoolean probeRunning =
-            new java.util.concurrent.atomic.AtomicBoolean(false);
-    private final java.util.concurrent.atomic.AtomicBoolean probeDirty =
-            new java.util.concurrent.atomic.AtomicBoolean(false);
-    private List<Account> probeQueue;
-    private int probeIndex;
-    private boolean probeChanged;
-
-    private final Runnable probeStep = this::probeStep;
+    private final SessionChecks sessionChecks = new SessionChecks(
+            callback -> webContainer.postOnAnimation(callback),
+            callback -> { if (webContainer != null) webContainer.removeCallbacks(callback); },
+            this::checkAccountSession);
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -156,6 +148,8 @@ public class MainActivity extends AppCompatActivity {
         edgeSwipe = findViewById(R.id.edgeSwipe);
         railAvatars = findViewById(R.id.railAvatars);
         accountList = findViewById(R.id.accountList);
+        railViews = new AccountViews(railAvatars, (account, selected) -> makeRailAvatar(account), this::bindRailAvatar);
+        drawerViews = new AccountViews(accountList, (account, selected) -> makeDrawerRow(account), AccountRow::bind);
         searchInput = findViewById(R.id.drawerSearch);
         drawerEmpty = findViewById(R.id.drawerEmpty);
         accCount = findViewById(R.id.accCount);
@@ -402,7 +396,7 @@ public class MainActivity extends AppCompatActivity {
                             + webErrored.get(a.id, false));
                     loadStartAt.remove(a.id);
                 }
-                refreshLogged();
+                if (resumed) sessionChecks.request(a.id);
                 if (a.id != store.getCurrentId() || !resumed) return;
                 if (webErrored.get(a.id, false)) {
                     showErrorOverlay(null); // 错误页已渲染，保持遮罩等用户重试
@@ -607,7 +601,7 @@ public class MainActivity extends AppCompatActivity {
             destroyWebView(entry.getKey(), webViews.remove(entry.getKey()));
         }
         cancelFileChooser();
-        probeQueue = null;
+        cancelProbe();
         super.onDestroy();
     }
 
@@ -634,10 +628,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void cancelProbe() {
-        mainHandler.removeCallbacks(probeStep);
-        probeQueue = null;
-        probeRunning.set(false);
-        probeDirty.set(false);
+        sessionChecks.cancel();
     }
 
     private void freezePages() {
@@ -704,6 +695,18 @@ public class MainActivity extends AppCompatActivity {
         if (!initialized) return;
         Account account = store.findById(id);
         if (account == null) return;
+        // Tapping the already visible account must not stop its page or reapply network settings.
+        if (resumed && store.getCurrentId() == id && currentWebView != null
+                && currentWebView.getVisibility() == View.VISIBLE
+                && !currentWebView.getSettings().getBlockNetworkLoads()
+                && !webErrored.get(id, false) && !interruptedLoads.contains(id)) {
+            try {
+                if (Objects.equals(appliedProxy, ProxySpec.parse(account.proxy).value)) {
+                    drawerLayout.closeDrawer(drawerContent);
+                    return;
+                }
+            } catch (IllegalArgumentException ignored) { }
+        }
         final long token = ++switchGeneration;
         freezePages();
         for (WebView view : webViews.snapshot().values()) view.setVisibility(View.GONE);
@@ -856,51 +859,27 @@ public class MainActivity extends AppCompatActivity {
 
     private void refreshLogged() {
         if (!initialized || !resumed) return;
-        if (!probeRunning.compareAndSet(false, true)) {
-            probeDirty.set(true); // 已有一轮在跑，结束后补一轮
-            return;
-        }
-        probeQueue = new ArrayList<>(store.all());
-        probeIndex = 0;
-        probeChanged = false;
-        probeStep();
+        long current = store.getCurrentId();
+        if (current > 0) sessionChecks.request(current);
+        for (Account account : store.all()) sessionChecks.request(account.id);
     }
 
-    private void probeStep() {
-        if (!initialized || !resumed) { cancelProbe(); return; }
-        if (probeQueue == null || probeIndex >= probeQueue.size()) {
-            probeQueue = null;
-            probeRunning.set(false);
-            if (probeDirty.compareAndSet(true, false)) refreshLogged();
-            return;
-        }
-        int end = Math.min(probeIndex + PROBE_CHUNK, probeQueue.size());
-        for (int i = probeIndex; i < end; i++) {
-            Account a = store.findById(probeQueue.get(i).id);
-            if (a == null) continue;
-            try {
-                Profile p = profileStore.getProfile(profileName(a.id));
-                if (p != null && (a.id != store.getCurrentId() || currentWebView == null)) {
-                    p.getServiceWorkerController().getServiceWorkerWebSettings().setBlockNetworkLoads(true);
-                }
-                // 不能用 hasCookies()：匿名访问也会落下 Cloudflare/Meta 埋点 cookie，一律误判已登录。
-                // 只认 muse.ai 的登录会话 cookie hatch_sess。
-                String cookies = p != null
-                        ? p.getCookieManager().getCookie("https://muse.ai/") : null;
-                boolean logged = TextRules.hasSession(cookies);
-                if (logged != a.logged) {
-                    a.logged = logged;
-                    probeChanged = true;
-                }
-            } catch (Exception ignored) {
+    private void checkAccountSession(long id) {
+        if (!initialized || !resumed) return;
+        Account account = store.findById(id);
+        if (account == null) return;
+        try {
+            Profile profile = profileStore.getProfile(profileName(id));
+            if (profile != null && (id != store.getCurrentId() || currentWebView == null)) {
+                profile.getServiceWorkerController().getServiceWorkerWebSettings().setBlockNetworkLoads(true);
             }
-        }
-        probeIndex = end;
-        if (probeChanged) {
-            renderAccounts();
-            probeChanged = false;
-        }
-        mainHandler.postDelayed(probeStep, 16); // 让出一帧再继续下一块
+            String cookies = profile == null ? null : profile.getCookieManager().getCookie(START_URL);
+            boolean logged = TextRules.hasSession(cookies);
+            if (logged != account.logged) {
+                account.logged = logged;
+                renderAccounts();
+            }
+        } catch (RuntimeException ignored) { }
     }
 
     private String profileName(long id) {
@@ -911,20 +890,15 @@ public class MainActivity extends AppCompatActivity {
 
     private void renderAccounts() {
         if (!initialized) return;
-        railAvatars.removeAllViews();
-        accountList.removeAllViews();
-        String q = query();
-        int shown = 0;
-        for (Account a : store.all()) {
-            if (!matches(a, q)) continue;
-            shown++;
-            railAvatars.addView(makeRailAvatar(a));
-            accountList.addView(makeDrawerRow(a));
-        }
-        accCount.setText(q.isEmpty() ? getString(R.string.accounts_count_fmt, store.all().size())
-                : getString(R.string.search_results_fmt, shown, store.all().size()));
-        emptyState.setVisibility(store.all().isEmpty() ? View.VISIBLE : View.GONE);
-        drawerEmpty.setVisibility(!q.isEmpty() && shown == 0 ? View.VISIBLE : View.GONE);
+        List<Account> accounts = store.all();
+        String query = query().toLowerCase(Locale.ROOT);
+        long current = store.getCurrentId();
+        int shown = railViews.update(accounts, current, account -> matches(account, query));
+        drawerViews.update(accounts, current, account -> matches(account, query));
+        AccountRow.setText(accCount, query.isEmpty() ? getString(R.string.accounts_count_fmt, accounts.size())
+                : getString(R.string.search_results_fmt, shown, accounts.size()));
+        emptyState.setVisibility(accounts.isEmpty() ? View.VISIBLE : View.GONE);
+        drawerEmpty.setVisibility(!query.isEmpty() && shown == 0 ? View.VISIBLE : View.GONE);
     }
 
     private String query() {
@@ -934,7 +908,7 @@ public class MainActivity extends AppCompatActivity {
     /** 按 名称 + 标签 过滤（忽略大小写，空 query 全匹配） */
     private boolean matches(Account a, String q) {
         if (q.isEmpty()) return true;
-        String key = q.toLowerCase(Locale.ROOT);
+        String key = q;
         if (a.name.toLowerCase(Locale.ROOT).contains(key)) return true;
         for (String t : a.tags) {
             if (t.toLowerCase(Locale.ROOT).contains(key)) return true;
@@ -984,17 +958,33 @@ public class MainActivity extends AppCompatActivity {
         dlp.bottomMargin = dp(1);
         wrap.addView(dot, dlp);
 
-        wrap.setContentDescription(a.name + "，" + getString(a.logged ? R.string.status_logged : R.string.status_not_logged));
-        wrap.setSelected(a.id == store.getCurrentId());
         wrap.setFocusable(true);
-        wrap.setTooltipText(a.name);
         wrap.setOnClickListener(v -> switchTo(a.id, true));
+        bindRailAvatar(wrap, a, a.id == store.getCurrentId());
         return wrap;
     }
 
-    private View makeDrawerRow(Account a) {
-        return AccountRow.create(accountList, a, a.id == store.getCurrentId(),
-                v -> switchTo(a.id, true), v -> showAccountMenu(v, a));
+    private void bindRailAvatar(View view, Account account, boolean selected) {
+        FrameLayout wrap = (FrameLayout) view;
+        if (wrap.isSelected() != selected) {
+            wrap.setBackgroundResource(selected ? R.drawable.bg_rail_active : R.drawable.bg_rail_btn);
+            wrap.setSelected(selected);
+        }
+        AccountRow.setText((TextView) wrap.getChildAt(0),
+                account.avatar == null || account.avatar.isEmpty() ? "m" : account.avatar);
+        wrap.getChildAt(1).setBackgroundResource(account.logged ? R.drawable.bg_dot_on : R.drawable.bg_dot_off);
+        wrap.setContentDescription(account.name + "，" + getString(
+                account.logged ? R.string.status_logged : R.string.status_not_logged));
+        wrap.setTooltipText(account.name);
+    }
+
+    private View makeDrawerRow(Account account) {
+        long id = account.id;
+        return AccountRow.create(accountList, account, id == store.getCurrentId(),
+                view -> switchTo(id, true), view -> {
+                    Account latest = store.findById(id);
+                    if (latest != null) showAccountMenu(view, latest);
+                });
     }
 
     private TextView makeTile(int sizePx, float textSp, String text) {

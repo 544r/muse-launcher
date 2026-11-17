@@ -7,6 +7,54 @@ import java.util.List;
 import static org.junit.Assert.*;
 
 public class SerialProxyQueueTest {
+    @Test public void identicalRequestsWaitForSuccessThenReuseAppliedSettings() {
+        List<String> starts = new ArrayList<>();
+        List<String> results = new ArrayList<>();
+        List<SerialProxyQueue.Completion> completions = new ArrayList<>();
+        SerialProxyQueue queue = new SerialProxyQueue((value, complete) -> {
+            starts.add(value); completions.add(complete);
+        });
+        queue.apply("", error -> results.add("first"));
+        queue.apply("", error -> results.add("second"));
+        assertTrue(results.isEmpty());
+        assertEquals(Arrays.asList(""), starts);
+        completions.get(0).done(null);
+        assertEquals(Arrays.asList("first", "second"), results);
+        assertEquals(1, starts.size());
+        queue.apply("", error -> results.add("third"));
+        assertEquals(1, starts.size());
+        assertEquals(3, results.size());
+    }
+
+    @Test public void queuedReturnToEarlierProxyCannotSkipPendingDifferentProxy() {
+        List<String> starts = new ArrayList<>();
+        List<SerialProxyQueue.Completion> completions = new ArrayList<>();
+        SerialProxyQueue queue = new SerialProxyQueue((value, complete) -> {
+            starts.add(value); completions.add(complete);
+        });
+        queue.apply("A", ignored -> {});
+        completions.get(0).done(null);
+        queue.apply("B", ignored -> {});
+        queue.apply("A", ignored -> {});
+        assertEquals(Arrays.asList("A", "B"), starts);
+        completions.get(1).done(null);
+        assertEquals(Arrays.asList("A", "B", "A"), starts);
+    }
+
+    @Test public void failedChangeInvalidatesPreviouslyAppliedValue() {
+        List<String> starts = new ArrayList<>();
+        List<SerialProxyQueue.Completion> completions = new ArrayList<>();
+        SerialProxyQueue queue = new SerialProxyQueue((value, complete) -> {
+            starts.add(value); completions.add(complete);
+        });
+        queue.apply("A", ignored -> {});
+        completions.get(0).done(null);
+        queue.apply("B", ignored -> {});
+        completions.get(1).done("failed");
+        queue.apply("A", ignored -> {});
+        assertEquals(Arrays.asList("A", "B", "A"), starts);
+    }
+
     @Test public void appliesOnlyAfterPreviousCompletionAndPropagatesFailure() {
         List<String> starts = new ArrayList<>();
         List<String> results = new ArrayList<>();
