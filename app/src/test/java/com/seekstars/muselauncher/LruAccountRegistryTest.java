@@ -12,6 +12,16 @@ import java.util.Map;
 
 /** M2/M4：LRU 注册表的驱逐决策 */
 public class LruAccountRegistryTest {
+    @Test public void callbackIdentityCheckDoesNotPromoteOldPage() {
+        LruAccountRegistry<Object> registry = new LruAccountRegistry<>(2);
+        Object first = new Object(), second = new Object(), third = new Object();
+        registry.put(1, first);
+        registry.put(2, second);
+        assertTrue(registry.isRegistered(1, first));
+        assertFalse(registry.isRegistered(1, second));
+        assertFalse(registry.isRegistered(9, first));
+        assertEquals(1L, registry.touchAndEvict(3, third).get(0).id);
+    }
 
     @Test
     public void putGetRemoveContains() {

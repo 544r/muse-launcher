@@ -15,6 +15,7 @@ public class AccountsStore {
     private static final String PREFS = "accounts";
     private final KeyValueStore prefs;
     private final List<Account> accounts = new ArrayList<>();
+    private final Map<Long, Account> byId = new HashMap<>();
     private final Set<Long> pendingDeletes = new LinkedHashSet<>();
     private long nextId = 1;
     private long currentId = -1;
@@ -56,6 +57,8 @@ public class AccountsStore {
         for (Account account : loaded) account.logged = sessions.getOrDefault(account.id, false);
         accounts.clear();
         accounts.addAll(loaded);
+        byId.clear();
+        for (Account account : loaded) byId.put(account.id, account);
         pendingDeletes.clear();
         pendingDeletes.addAll(deleting);
         nextId = repairedNext;
@@ -113,8 +116,7 @@ public class AccountsStore {
     }
 
     public synchronized Account findById(long id) {
-        for (Account a : accounts) if (a.id == id) return a;
-        return null;
+        return byId.get(id);
     }
 
     public synchronized long getCurrentId() { return currentId; }
@@ -128,10 +130,12 @@ public class AccountsStore {
         nextId++;
         currentId = a.id;
         accounts.add(a);
+        byId.put(a.id, a);
         try {
             save();
         } catch (RuntimeException e) {
             accounts.remove(a);
+            byId.remove(a.id);
             nextId--;
             currentId = before;
             throw e;
@@ -168,6 +172,7 @@ public class AccountsStore {
         int position = accounts.indexOf(a);
         long before = currentId;
         accounts.remove(a);
+        byId.remove(id);
         if (currentId == id) currentId = accounts.isEmpty() ? -1 : accounts.get(0).id;
         pendingDeletes.add(id);
         try {
@@ -178,6 +183,7 @@ public class AccountsStore {
             prefs.putAll(values);
         } catch (RuntimeException e) {
             accounts.add(position, a);
+            byId.put(id, a);
             currentId = before;
             pendingDeletes.remove(id);
             throw e;

@@ -12,6 +12,30 @@ import java.util.Map;
 
 /** M3：AccountsStore 备份/自愈/通知逻辑（HashMap 假 KV，纯 JVM 测试） */
 public class AccountsStoreTest {
+    @Test public void failedRemovalRestoresIndexAndReloadUsesFreshObjects() {
+        boolean[] fail = {false};
+        FakeKv kv = new FakeKv() {
+            @Override public void putAll(Map<String, Object> values) {
+                if (fail[0]) throw new IllegalStateException("simulated storage failure");
+                super.putAll(values);
+            }
+        };
+        AccountsStore store = new AccountsStore(kv);
+        Account first = store.addDefault();
+        Account second = store.addDefault();
+        fail[0] = true;
+        try { store.remove(first.id); org.junit.Assert.fail(); }
+        catch (IllegalStateException expected) { }
+        org.junit.Assert.assertSame(first, store.findById(first.id));
+        assertEquals(2, store.all().size());
+        fail[0] = false;
+        store.remove(first.id);
+        assertNull(store.findById(first.id));
+        store.reload();
+        org.junit.Assert.assertNotSame(second, store.findById(second.id));
+        assertEquals(second.name, store.findById(second.id).name);
+        assertNull(store.findById(first.id));
+    }
     @Test public void reloadKeepsKnownRuntimeSessionButDoesNotPersistItAcrossInstances() {
         FakeKv kv = new FakeKv();
         AccountsStore store = new AccountsStore(kv);

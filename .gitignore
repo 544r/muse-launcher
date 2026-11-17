@@ -21,3 +21,7 @@ signing.properties
 .externalNativeBuild/
 .cxx/
 .DS_Store
+
+# Local performance tooling
+__pycache__/
+*.py[cod]

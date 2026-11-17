@@ -1,0 +1,15 @@
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="56dp"
+    android:paddingStart="6dp" android:paddingEnd="6dp" android:paddingTop="4dp" android:paddingBottom="4dp">
+    <FrameLayout android:id="@+id/railButton" android:layout_width="48dp" android:layout_height="48dp"
+        android:layout_gravity="center" android:background="@drawable/bg_rail_btn"
+        android:foreground="?attr/selectableItemBackground" android:clickable="true" android:focusable="true">
+        <TextView android:id="@+id/accountAvatar" android:layout_width="38dp" android:layout_height="38dp"
+            android:layout_gravity="center" android:background="@drawable/bg_mtile" android:gravity="center"
+            android:includeFontPadding="false" android:textColor="@color/m_blue" android:textSize="20sp"
+            android:textStyle="bold|italic" android:importantForAccessibility="no" />
+        <View android:id="@+id/accountDot" android:layout_width="10dp" android:layout_height="10dp"
+            android:layout_gravity="bottom|end" android:layout_marginEnd="1dp" android:layout_marginBottom="1dp"
+            android:background="@drawable/bg_dot_off" android:importantForAccessibility="no" />
+    </FrameLayout>
+</FrameLayout>

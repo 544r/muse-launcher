@@ -47,6 +47,14 @@ public class LruAccountRegistry<T> {
         return map.containsKey(id);
     }
 
+    /** Identity check for frequent WebView callbacks, without copying or changing LRU order. */
+    public boolean isRegistered(long id, T value) {
+        for (Map.Entry<Long, T> entry : map.entrySet()) {
+            if (entry.getKey() == id) return entry.getValue() == value;
+        }
+        return false;
+    }
+
     public int size() {
         return map.size();
     }

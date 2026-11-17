@@ -2,12 +2,12 @@ package com.seekstars.muselauncher;
 
 import android.app.DownloadManager;
 import android.content.Intent;
-import android.graphics.Typeface;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.os.Trace;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.TextWatcher;
@@ -17,8 +17,8 @@ import android.webkit.HttpAuthHandler;
 import android.webkit.WebResourceResponse;
 import java.util.Locale;
 import java.util.Objects;
-import android.view.Gravity;
 import android.view.MotionEvent;
+import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.inputmethod.EditorInfo;
@@ -32,17 +32,21 @@ import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
 import android.widget.EditText;
 import android.widget.FrameLayout;
-import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 import java.util.List;
 import java.util.Map;
+import java.util.ArrayList;
+import java.util.Collections;
 
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.appcompat.widget.PopupMenu;
 import android.view.inputmethod.InputMethodManager;
 import androidx.drawerlayout.widget.DrawerLayout;
+import androidx.recyclerview.widget.ConcatAdapter;
+import androidx.recyclerview.widget.LinearLayoutManager;
+import androidx.recyclerview.widget.RecyclerView;
 import androidx.webkit.Profile;
 import androidx.webkit.ProfileStore;
 import androidx.webkit.WebViewCompat;
@@ -53,8 +57,6 @@ public class MainActivity extends AppCompatActivity {
     private static final String START_URL = "https://muse.ai/";
     private static final int REQ_FILE = 10001;
     private static final int REQ_CONFIG = 10002;
-    private static final long MIN_SPLASH_MS = 150;
-    private static final long SPLASH_TIMEOUT_MS = 8000;
     /** muse.ai 登录会话 cookie（httpOnly）。匿名访问只会落下 hatch_native_auth_* 等流程 cookie。 */
 
 
@@ -62,20 +64,24 @@ public class MainActivity extends AppCompatActivity {
     private ProfileStore profileStore;
     private boolean initialized;
     private boolean resumed;
+    private boolean accountsNeedReload;
     private long switchGeneration;
     private String appliedProxy;
     private final java.util.Set<Long> interruptedLoads = new java.util.HashSet<>();
-    private final Runnable renderAccountsRunnable = this::renderAccounts;
+    private final java.util.Set<WebView> frozenPages = Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+    private final Runnable renderAccountsRunnable = this::filterAccounts;
 
     private DrawerLayout drawerLayout;
     private View drawerContent;
+    private int drawerState = DrawerLayout.STATE_IDLE;
     private View rail;
     private View edgeSwipe;
-    private LinearLayout railAvatars;
-    private LinearLayout accountList;
-    private AccountViews railViews, drawerViews;
+    private RecyclerView railAvatars, accountList;
+    private AccountAdapter railAdapter, drawerAdapter;
+    private AccountFooterAdapter footerAdapter;
+    private List<AccountItem> accountItems = Collections.emptyList();
+    private int filterGeneration;
     private EditText searchInput;
-    private View drawerEmpty;
     private TextView accCount;
     private FrameLayout webContainer;
     private View emptyState;
@@ -94,17 +100,21 @@ public class MainActivity extends AppCompatActivity {
     private final LongSparseArray<Long> loadStartAt = new LongSparseArray<>();
     private WebView currentWebView;
 
-    private long splashShownAt;
-    private final Runnable hideSplashRunnable = this::hideSplash;
+    private LoadingOverlay loadingOverlay;
     private final FileSelection fileSelection = new FileSelection();
     private boolean fullscreen;
     private float edgeStartX;
     private long edgeDownAt;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final TransitionTask pageActivation = new TransitionTask(
+            () -> drawerLayout != null && drawerState == DrawerLayout.STATE_IDLE
+                    && !drawerLayout.isDrawerVisible(drawerContent),
+            mainHandler::post, mainHandler::removeCallbacks);
+    private final IdleTaskScheduler sessionScheduler = new IdleTaskScheduler();
+    private final Object touchInteraction = new Object();
     private final SessionChecks sessionChecks = new SessionChecks(
-            callback -> webContainer.postOnAnimation(callback),
-            callback -> { if (webContainer != null) webContainer.removeCallbacks(callback); },
+            sessionScheduler::schedule, sessionScheduler::cancel,
             this::checkAccountSession);
 
     @Override
@@ -142,22 +152,37 @@ public class MainActivity extends AppCompatActivity {
             }
         });
         drawerLayout.addDrawerListener(new DrawerLayout.SimpleDrawerListener() {
-            @Override public void onDrawerClosed(View drawer) { dismissSearchKeyboard(); }
+            @Override public void onDrawerClosed(View drawer) {
+                dismissSearchKeyboard();
+                pageActivation.onTransitionChanged();
+            }
+            @Override public void onDrawerOpened(View drawer) { requestVisibleSessions(accountList); }
+            @Override public void onDrawerStateChanged(int state) {
+                drawerState = state;
+                sessionScheduler.setBusy(drawerLayout, state != DrawerLayout.STATE_IDLE);
+                pageActivation.onTransitionChanged();
+            }
         });
         rail = findViewById(R.id.rail);
         edgeSwipe = findViewById(R.id.edgeSwipe);
         railAvatars = findViewById(R.id.railAvatars);
         accountList = findViewById(R.id.accountList);
-        railViews = new AccountViews(railAvatars, (account, selected) -> makeRailAvatar(account), this::bindRailAvatar);
-        drawerViews = new AccountViews(accountList, (account, selected) -> makeDrawerRow(account), AccountRow::bind);
+        railAdapter = new AccountAdapter(true, this::hasSession, id -> switchTo(id, true), this::showAccountMenuById);
+        drawerAdapter = new AccountAdapter(false, this::hasSession, id -> switchTo(id, true), this::showAccountMenuById);
+        footerAdapter = new AccountFooterAdapter();
+        configureAccountList(railAvatars);
+        configureAccountList(accountList);
+        railAvatars.setAdapter(railAdapter);
+        accountList.setAdapter(new ConcatAdapter(new ConcatAdapter.Config.Builder()
+                .setStableIdMode(ConcatAdapter.Config.StableIdMode.ISOLATED_STABLE_IDS).build(), drawerAdapter, footerAdapter));
         searchInput = findViewById(R.id.drawerSearch);
-        drawerEmpty = findViewById(R.id.drawerEmpty);
         accCount = findViewById(R.id.accCount);
         webContainer = findViewById(R.id.webContainer);
         errorOverlay = findViewById(R.id.errorOverlay);
         errorMsg = findViewById(R.id.errorMsg);
         emptyState = findViewById(R.id.emptyState);
         splash = findViewById(R.id.splash);
+        loadingOverlay = new LoadingOverlay(splash);
         splashName = findViewById(R.id.splashName);
 
         findViewById(R.id.btnRailExpand).setOnClickListener(v ->
@@ -198,6 +223,7 @@ public class MainActivity extends AppCompatActivity {
 
             @Override
             public void afterTextChanged(Editable s) {
+                sessionScheduler.defer();
                 findViewById(R.id.searchClear).setVisibility(s.length() == 0 ? View.GONE : View.VISIBLE);
                 searchInput.setPaddingRelative(dp(40), dp(11), dp(s.length() == 0 ? 12 : 48), dp(11));
                 mainHandler.removeCallbacks(renderAccountsRunnable);
@@ -237,6 +263,21 @@ public class MainActivity extends AppCompatActivity {
 
     boolean supportsProfiles() {
         return WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE);
+    }
+
+    @Override public boolean dispatchTouchEvent(MotionEvent event) {
+        int action = event.getActionMasked();
+        if (action == MotionEvent.ACTION_DOWN) sessionScheduler.setBusy(touchInteraction, true);
+        try { return super.dispatchTouchEvent(event); }
+        finally {
+            if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL)
+                sessionScheduler.setBusy(touchInteraction, false);
+        }
+    }
+
+    @Override public boolean dispatchKeyEvent(KeyEvent event) {
+        sessionScheduler.defer();
+        return super.dispatchKeyEvent(event);
     }
 
     @Override
@@ -345,187 +386,198 @@ public class MainActivity extends AppCompatActivity {
     // ---------- WebView（每账号独立实例） ----------
 
     private WebView getOrCreateWebView(final Account a, final ProxySpec proxy) {
-        WebView wv = webViews.get(a.id);
-        if (wv != null) return wv;
+        Trace.beginSection("Muse.createWebView");
+        try {
+            WebView wv = webViews.get(a.id);
+            if (wv != null) return wv;
 
-        wv = new WebView(this);
-        wv.setLayoutParams(new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        wv.setBackgroundColor(0xFF121316);
+            wv = new WebView(this);
+            wv.setLayoutParams(new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+            wv.setBackgroundColor(0xFF121316);
+            wv.setOnScrollChangeListener((view, x, y, oldX, oldY) -> {
+                if (view == currentWebView) sessionScheduler.defer();
+            });
 
-        WebSettings s = wv.getSettings();
-        s.setJavaScriptEnabled(true);
-        s.setDomStorageEnabled(true);
-        s.setAllowFileAccess(false);
-        s.setSupportMultipleWindows(false);
-        s.setMediaPlaybackRequiresUserGesture(true);
-        // 去掉 WebView 标识（; wv / Version/4.0），否则 muse.ai 会把页面重定向到 Play 商店
-        String ua = s.getUserAgentString();
-        if (ua != null) {
-            String chromeUa = ua.replace("; wv", "");
-            chromeUa = chromeUa.replaceAll("\\s*Version/[\\d.]+", "");
-            s.setUserAgentString(chromeUa);
-        }
-
-        wv.setWebViewClient(new WebViewClient() {
-            private boolean authenticated;
-
-            private boolean live(WebView view) {
-                return initialized && webViews.snapshot().get(a.id) == view && store.findById(a.id) != null;
+            WebSettings s = wv.getSettings();
+            s.setJavaScriptEnabled(true);
+            s.setDomStorageEnabled(true);
+            s.setAllowFileAccess(false);
+            s.setSupportMultipleWindows(false);
+            s.setMediaPlaybackRequiresUserGesture(true);
+            // 去掉 WebView 标识（; wv / Version/4.0），否则 muse.ai 会把页面重定向到 Play 商店
+            String ua = s.getUserAgentString();
+            if (ua != null) {
+                String chromeUa = ua.replace("; wv", "");
+                chromeUa = chromeUa.replaceAll("\\s*Version/[\\d.]+", "");
+                s.setUserAgentString(chromeUa);
             }
 
-            @Override
-            public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
-                if (!live(view)) return;
-                authenticated = false;
-                webLoaded.put(a.id, false);
-                if (webErrored.get(a.id, false)) {
-                    // 新一次加载开始：清错误标记，失败会由 onReceivedError 重新置位
-                    webErrored.put(a.id, false);
+            wv.setWebViewClient(new WebViewClient() {
+                private boolean authenticated;
+
+                private boolean live(WebView view) {
+                    return initialized && webViews.isRegistered(a.id, view) && store.findById(a.id) != null;
                 }
-            }
 
-            @Override
-            public void onPageFinished(WebView view, String url) {
-                if (!live(view) || interruptedLoads.contains(a.id)) return;
-                webLoaded.put(a.id, !webErrored.get(a.id, false));
-                Long st = loadStartAt.get(a.id);
-                if (st != null) {
-                    Log.i("MusePerf", "load end id=" + a.id + " cost="
-                            + (SystemClock.uptimeMillis() - st) + "ms errored="
-                            + webErrored.get(a.id, false));
-                    loadStartAt.remove(a.id);
+                @Override
+                public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
+                    if (!live(view)) return;
+                    authenticated = false;
+                    webLoaded.put(a.id, false);
+                    if (webErrored.get(a.id, false)) {
+                        // 新一次加载开始：清错误标记，失败会由 onReceivedError 重新置位
+                        webErrored.put(a.id, false);
+                    }
                 }
-                if (resumed) sessionChecks.request(a.id);
-                if (a.id != store.getCurrentId() || !resumed) return;
-                if (webErrored.get(a.id, false)) {
-                    showErrorOverlay(null); // 错误页已渲染，保持遮罩等用户重试
-                } else {
-                    hideErrorOverlay();
+
+                @Override
+                public void onPageCommitVisible(WebView view, String url) {
+                    if (!live(view) || !resumed || view != currentWebView || a.id != store.getCurrentId()
+                            || interruptedLoads.contains(a.id) || webErrored.get(a.id, false)) return;
+                    hideSplash();
                 }
-                long elapsed = SystemClock.uptimeMillis() - splashShownAt;
-                webContainer.postDelayed(hideSplashRunnable,
-                        Math.max(0, MIN_SPLASH_MS - elapsed));
-            }
 
-            @Override
-            public void onReceivedError(WebView view, WebResourceRequest request,
-                                        WebResourceError error) {
-                if (!live(view) || !request.isForMainFrame()) return;
-                webErrored.put(a.id, true);
-                Log.i("MusePerf", "load error id=" + a.id
-                        + " desc=" + error.getDescription());
-                if (a.id == store.getCurrentId()) {
-                    showErrorOverlay(error.getDescription() != null
-                            ? error.getDescription().toString() : null);
+                @Override
+                public void onPageFinished(WebView view, String url) {
+                    if (!live(view) || interruptedLoads.contains(a.id)) return;
+                    webLoaded.put(a.id, !webErrored.get(a.id, false));
+                    Long st = loadStartAt.get(a.id);
+                    if (st != null) {
+                        Log.i("MusePerf", "load end id=" + a.id + " cost="
+                                + (SystemClock.uptimeMillis() - st) + "ms errored="
+                                + webErrored.get(a.id, false));
+                        loadStartAt.remove(a.id);
+                    }
+                    if (resumed) sessionChecks.request(a.id);
+                    if (a.id != store.getCurrentId() || !resumed) return;
+                    if (webErrored.get(a.id, false)) {
+                        showErrorOverlay(null); // 错误页已渲染，保持遮罩等用户重试
+                    } else {
+                        hideErrorOverlay();
+                    }
+                    hideSplash();
                 }
-            }
 
-            @Override
-            public void onReceivedHttpError(WebView view, WebResourceRequest request,
-                                             WebResourceResponse response) {
-                if (!live(view) || !request.isForMainFrame()) return;
-                webErrored.put(a.id, true);
-                if (a.id == store.getCurrentId()) showErrorOverlay("HTTP " + response.getStatusCode());
-            }
-
-            @Override
-            public void onReceivedHttpAuthRequest(WebView view, HttpAuthHandler auth, String host, String realm) {
-                if (live(view) && !authenticated && proxy.authenticates(host)) {
-                    authenticated = true;
-                    auth.proceed(proxy.username, proxy.password);
-                } else auth.cancel();
-            }
-
-            @Override
-            public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
-                if (!live(view)) return true;
-                boolean wasCurrent = currentWebView == view;
-                destroyWebView(a.id, webViews.remove(a.id), true);
-                if (wasCurrent && resumed) mainHandler.post(() -> {
-                    if (initialized && resumed && store.getCurrentId() == a.id) switchTo(a.id, false);
-                });
-                toast(getString(R.string.toast_webview_recovered));
-                return true;
-            }
-
-            @Override
-            public boolean shouldOverrideUrlLoading(WebView view, String url) {
-                Uri u = Uri.parse(url);
-                String scheme = u.getScheme();
-                if ("http".equals(scheme) || "https".equals(scheme)) return false;
-                try {
-                    startActivity(new Intent(Intent.ACTION_VIEW, u));
-                } catch (Exception ignored) {
+                @Override
+                public void onReceivedError(WebView view, WebResourceRequest request,
+                                            WebResourceError error) {
+                    if (!live(view) || !request.isForMainFrame()) return;
+                    webErrored.put(a.id, true);
+                    Log.i("MusePerf", "load error id=" + a.id
+                            + " desc=" + error.getDescription());
+                    if (a.id == store.getCurrentId()) {
+                        showErrorOverlay(error.getDescription() != null
+                                ? error.getDescription().toString() : null);
+                    }
                 }
-                return true;
-            }
-        });
 
-        wv.setWebChromeClient(new WebChromeClient() {
-            @Override
-            public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback,
-                                             FileChooserParams params) {
-                if (!resumed || view != currentWebView) return false;
-                fileSelection.begin(view, callback);
-                try {
-                    startActivityForResult(params.createIntent(), REQ_FILE);
-                    return true;
-                } catch (Exception e) {
-                    fileSelection.cancel();
-                    toast(getString(R.string.toast_no_filechooser));
+                @Override
+                public void onReceivedHttpError(WebView view, WebResourceRequest request,
+                                                 WebResourceResponse response) {
+                    if (!live(view) || !request.isForMainFrame()) return;
+                    webErrored.put(a.id, true);
+                    if (a.id == store.getCurrentId()) showErrorOverlay("HTTP " + response.getStatusCode());
+                }
+
+                @Override
+                public void onReceivedHttpAuthRequest(WebView view, HttpAuthHandler auth, String host, String realm) {
+                    if (live(view) && !authenticated && proxy.authenticates(host)) {
+                        authenticated = true;
+                        auth.proceed(proxy.username, proxy.password);
+                    } else auth.cancel();
+                }
+
+                @Override
+                public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
+                    if (!live(view)) return true;
+                    boolean wasCurrent = currentWebView == view;
+                    destroyWebView(a.id, webViews.remove(a.id), true);
+                    if (wasCurrent && resumed) mainHandler.post(() -> {
+                        if (initialized && resumed && store.getCurrentId() == a.id) switchTo(a.id, false);
+                    });
+                    toast(getString(R.string.toast_webview_recovered));
                     return true;
                 }
-            }
-        });
 
-        wv.setDownloadListener((url, userAgent, contentDisposition, mimeType, length) -> {
-            if (!initialized || !resumed || store.getCurrentId() != a.id || store.findById(a.id) == null) return;
-            if (!"https".equalsIgnoreCase(Uri.parse(url).getScheme())) {
-                toast("该链接不支持直接下载，请使用网页提供的 HTTPS 下载链接");
-                return;
-            }
-            try {
-                Profile profile = profileStore.getProfile(profileName(a.id));
-                String cookie = profile == null ? null : profile.getCookieManager().getCookie(url);
-                if (!proxy.rule.isEmpty() || (cookie != null && !cookie.isEmpty())) {
-                    AccountDownloads.start(this, a.id, url, userAgent, contentDisposition, mimeType, proxy);
+                @Override
+                public boolean shouldOverrideUrlLoading(WebView view, String url) {
+                    Uri u = Uri.parse(url);
+                    String scheme = u.getScheme();
+                    if ("http".equals(scheme) || "https".equals(scheme)) return false;
+                    try {
+                        startActivity(new Intent(Intent.ACTION_VIEW, u));
+                    } catch (Exception ignored) {
+                    }
+                    return true;
+                }
+            });
+
+            wv.setWebChromeClient(new WebChromeClient() {
+                @Override
+                public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback,
+                                                 FileChooserParams params) {
+                    if (!resumed || view != currentWebView) return false;
+                    fileSelection.begin(view, callback);
+                    try {
+                        startActivityForResult(params.createIntent(), REQ_FILE);
+                        return true;
+                    } catch (Exception e) {
+                        fileSelection.cancel();
+                        toast(getString(R.string.toast_no_filechooser));
+                        return true;
+                    }
+                }
+            });
+
+            wv.setDownloadListener((url, userAgent, contentDisposition, mimeType, length) -> {
+                if (!initialized || !resumed || store.getCurrentId() != a.id || store.findById(a.id) == null) return;
+                if (!"https".equalsIgnoreCase(Uri.parse(url).getScheme())) {
+                    toast("该链接不支持直接下载，请使用网页提供的 HTTPS 下载链接");
                     return;
                 }
-                // 公共资源交给系统；不把 Cookie 加到会跨站重定向的固定请求头中。
-                DownloadManager.Request req = new DownloadManager.Request(Uri.parse(url));
-                String filename = android.webkit.URLUtil.guessFileName(url, contentDisposition, mimeType);
-                req.setTitle(filename);
-                if (mimeType != null) req.setMimeType(mimeType);
-                req.setDestinationInExternalPublicDir(android.os.Environment.DIRECTORY_DOWNLOADS, filename);
-                req.setNotificationVisibility(
-                        DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
-                if (userAgent != null) req.addRequestHeader("User-Agent", userAgent);
-                DownloadManager dm = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
-                dm.enqueue(req);
-                toast(getString(R.string.toast_download_started));
+                try {
+                    Profile profile = profileStore.getProfile(profileName(a.id));
+                    String cookie = profile == null ? null : profile.getCookieManager().getCookie(url);
+                    if (!proxy.rule.isEmpty() || (cookie != null && !cookie.isEmpty())) {
+                        AccountDownloads.start(this, a.id, url, userAgent, contentDisposition, mimeType, proxy);
+                        return;
+                    }
+                    // 公共资源交给系统；不把 Cookie 加到会跨站重定向的固定请求头中。
+                    DownloadManager.Request req = new DownloadManager.Request(Uri.parse(url));
+                    String filename = android.webkit.URLUtil.guessFileName(url, contentDisposition, mimeType);
+                    req.setTitle(filename);
+                    if (mimeType != null) req.setMimeType(mimeType);
+                    req.setDestinationInExternalPublicDir(android.os.Environment.DIRECTORY_DOWNLOADS, filename);
+                    req.setNotificationVisibility(
+                            DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+                    if (userAgent != null) req.addRequestHeader("User-Agent", userAgent);
+                    DownloadManager dm = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
+                    dm.enqueue(req);
+                    toast(getString(R.string.toast_download_started));
+                } catch (Exception e) {
+                    toast("无法开始下载，请检查下载链接和存储空间");
+                }
+            });
+
+            // Profile 必须在任何页面加载前设置，且每个 WebView 只能设置一次
+            try {
+                WebViewCompat.setProfile(wv, profileName(a.id));
+                WebViewCompat.getProfile(wv).getServiceWorkerController().getServiceWorkerWebSettings()
+                        .setBlockNetworkLoads(false);
             } catch (Exception e) {
-                toast("无法开始下载，请检查下载链接和存储空间");
+                wv.destroy();
+                toast("创建隔离环境失败：" + e.getMessage());
+                return null;
             }
-        });
 
-        // Profile 必须在任何页面加载前设置，且每个 WebView 只能设置一次
-        try {
-            WebViewCompat.setProfile(wv, profileName(a.id));
-            WebViewCompat.getProfile(wv).getServiceWorkerController().getServiceWorkerWebSettings()
-                    .setBlockNetworkLoads(false);
-        } catch (Exception e) {
-            wv.destroy();
-            toast("创建隔离环境失败：" + e.getMessage());
-            return null;
-        }
-
-        loadStartAt.put(a.id, SystemClock.uptimeMillis());
-        Log.i("MusePerf", "load start id=" + a.id);
-        webContainer.addView(wv);
-        webViews.put(a.id, wv);
-        wv.loadUrl(START_URL);
-        return wv;
+            loadStartAt.put(a.id, SystemClock.uptimeMillis());
+            Log.i("MusePerf", "load start id=" + a.id);
+            webContainer.addView(wv);
+            webViews.put(a.id, wv);
+            wv.loadUrl(START_URL);
+            return wv;
+        } finally { Trace.endSection(); }
     }
 
     private void showErrorOverlay(String msg) {
@@ -551,7 +603,7 @@ public class MainActivity extends AppCompatActivity {
             }
             return;
         }
-        // 配置在 onResume 中先 reload，再渲染和应用代理。
+        // 配置返回时在 onResume 中先 reload，再渲染和应用代理。
         super.onActivityResult(requestCode, resultCode, data);
     }
 
@@ -560,11 +612,17 @@ public class MainActivity extends AppCompatActivity {
         super.onResume();
         if (!initialized) return;
         resumed = true;
+        sessionScheduler.defer();
         try {
-            store.reload();
-            checkStoreNotice();
             cancelProbe();
-            renderAccounts();
+            // onCreate already loaded/rendered; only the configuration activity edits another store instance.
+            // Ordinary foreground returns and file selection do not need JSON parsing or two list diffs.
+            if (accountsNeedReload) {
+                store.reload();
+                checkStoreNotice();
+                renderAccounts();
+                accountsNeedReload = false;
+            }
             long id = store.getCurrentId();
             if (id > 0) switchTo(id, false);
             refreshLogged();
@@ -578,13 +636,18 @@ public class MainActivity extends AppCompatActivity {
     protected void onPause() {
         resumed = false;
         ++switchGeneration;
+        pageActivation.cancel();
         if (initialized) {
             freezePages();
             cancelProbe();
+            sessionScheduler.clear();
+            hideSplash();
             // 只刷新当前已加载 Profile，避免逐个加载全部账号并同步写盘。
             if (currentWebView != null) {
+                Trace.beginSection("Muse.flushCookies");
                 try { WebViewCompat.getProfile(currentWebView).getCookieManager().flush(); }
                 catch (RuntimeException ignored) { }
+                finally { Trace.endSection(); }
             }
         }
         super.onPause();
@@ -596,7 +659,9 @@ public class MainActivity extends AppCompatActivity {
         resumed = false;
         ++switchGeneration;
         mainHandler.removeCallbacksAndMessages(null);
-        if (webContainer != null) webContainer.removeCallbacks(hideSplashRunnable);
+        pageActivation.cancel();
+        if (loadingOverlay != null) loadingOverlay.hide();
+        sessionScheduler.clear();
         for (Map.Entry<Long, WebView> entry : webViews.snapshot().entrySet()) {
             destroyWebView(entry.getKey(), webViews.remove(entry.getKey()));
         }
@@ -632,15 +697,23 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void freezePages() {
-        for (Map.Entry<Long, WebView> entry : webViews.snapshot().entrySet()) {
-            WebView view = entry.getValue();
-            if (!webLoaded.get(entry.getKey(), false)) interruptedLoads.add(entry.getKey());
-            view.onPause();
-            view.getSettings().setBlockNetworkLoads(true);
-            view.stopLoading();
-            try { WebViewCompat.getProfile(view).getServiceWorkerController().getServiceWorkerWebSettings()
-                    .setBlockNetworkLoads(true); } catch (RuntimeException ignored) { }
-        }
+        Trace.beginSection("Muse.freezePages");
+        try {
+            for (Map.Entry<Long, WebView> entry : webViews.snapshot().entrySet()) {
+                WebView view = entry.getValue();
+                if (frozenPages.contains(view)) continue;
+                if (!webLoaded.get(entry.getKey(), false)) interruptedLoads.add(entry.getKey());
+                view.onPause();
+                view.getSettings().setBlockNetworkLoads(true);
+                view.stopLoading();
+                try {
+                    WebViewCompat.getProfile(view).getServiceWorkerController().getServiceWorkerWebSettings()
+                            .setBlockNetworkLoads(true);
+                    // Only skip future freezes after all operations succeeded; retry failures.
+                    frozenPages.add(view);
+                } catch (RuntimeException ignored) { }
+            }
+        } finally { Trace.endSection(); }
     }
 
     private void destroyWebView(long id, WebView view) {
@@ -653,6 +726,7 @@ public class MainActivity extends AppCompatActivity {
         loadStartAt.remove(id);
         interruptedLoads.remove(id);
         if (view == null) return;
+        frozenPages.remove(view);
         fileSelection.cancelFor(view);
         if (currentWebView == view) currentWebView = null;
         webContainer.removeView(view);
@@ -678,6 +752,7 @@ public class MainActivity extends AppCompatActivity {
             i.putExtra("proxy_autotest", autoTest);
             i.putExtra("proxy_save", autoSave);
         }
+        accountsNeedReload = true;
         startActivityForResult(i, REQ_CONFIG);
     }
 
@@ -687,77 +762,96 @@ public class MainActivity extends AppCompatActivity {
         final Account a;
         try { a = store.addDefault(prev != null ? prev.proxy : null); }
         catch (RuntimeException e) { toast("创建账号失败，请检查可用存储空间"); return; }
+        renderAccounts();
         switchTo(a.id, true);
         toast(getString(R.string.toast_created, a.name));
     }
 
     private void switchTo(long id, boolean animate) {
-        if (!initialized) return;
-        Account account = store.findById(id);
-        if (account == null) return;
-        // Tapping the already visible account must not stop its page or reapply network settings.
-        if (resumed && store.getCurrentId() == id && currentWebView != null
-                && currentWebView.getVisibility() == View.VISIBLE
-                && !currentWebView.getSettings().getBlockNetworkLoads()
-                && !webErrored.get(id, false) && !interruptedLoads.contains(id)) {
-            try {
-                if (Objects.equals(appliedProxy, ProxySpec.parse(account.proxy).value)) {
-                    drawerLayout.closeDrawer(drawerContent);
-                    return;
-                }
-            } catch (IllegalArgumentException ignored) { }
-        }
-        final long token = ++switchGeneration;
-        freezePages();
-        for (WebView view : webViews.snapshot().values()) view.setVisibility(View.GONE);
-        currentWebView = null;
-        final ProxySpec proxy;
+        Trace.beginSection("Muse.switchAccount");
         try {
-            store.setCurrent(id);
-            renderAccounts();
-            proxy = ProxySpec.parse(account.proxy);
-        } catch (RuntimeException e) {
-            showErrorOverlay("无法切换账号，请检查账号数据和代理配置");
-            return;
-        }
-        if (!resumed) return;
-        // 只有相同代理的页面可继续驻留；出口变化时先关闭旧页面连接。
-        if (!Objects.equals(appliedProxy, proxy.value)) {
-            for (Map.Entry<Long, WebView> entry : webViews.snapshot().entrySet()) {
-                destroyWebView(entry.getKey(), webViews.remove(entry.getKey()));
+            if (!initialized) return;
+            Account account = store.findById(id);
+            if (account == null) return;
+            // Tapping the already visible account must not stop its page or reapply network settings.
+            if (resumed && store.getCurrentId() == id && currentWebView != null
+                    && currentWebView.getVisibility() == View.VISIBLE
+                    && !currentWebView.getSettings().getBlockNetworkLoads()
+                    && !webErrored.get(id, false) && !interruptedLoads.contains(id)) {
+                try {
+                    if (Objects.equals(appliedProxy, ProxySpec.parse(account.proxy).value)) {
+                        drawerLayout.closeDrawer(drawerContent);
+                        return;
+                    }
+                } catch (IllegalArgumentException ignored) { }
             }
-        }
-        hideErrorOverlay();
-        if (animate) showSplashFor(account);
-        drawerLayout.closeDrawer(drawerContent);
-        ProxyHelper.apply(proxy.value, error -> {
-            if (!initialized || !resumed || token != switchGeneration || store.getCurrentId() != id) return;
-            if (error != null) { showErrorOverlay(error); return; }
-            appliedProxy = proxy.value;
-            Account latest = store.findById(id);
-            if (latest == null) return;
-            WebView target = webViews.get(id);
-            boolean existed = target != null;
-            if (target == null) target = getOrCreateWebView(latest, proxy);
-            if (target == null) { showErrorOverlay("创建隔离环境失败，请重试"); return; }
-            currentWebView = target;
-            target.getSettings().setBlockNetworkLoads(false);
-            WebViewCompat.getProfile(target).getServiceWorkerController().getServiceWorkerWebSettings()
-                    .setBlockNetworkLoads(false);
-            target.setVisibility(View.VISIBLE);
-            target.onResume();
-            for (LruAccountRegistry.Evicted<WebView> evicted : webViews.touchAndEvict(id, target)) {
-                destroyWebView(evicted.id, evicted.value);
+            final long token = ++switchGeneration;
+            pageActivation.cancel();
+            freezePages();
+            // Keep the dimensions of cached pages; returning to one need not request a new layout.
+            for (WebView view : webViews.snapshot().values()) view.setVisibility(View.INVISIBLE);
+            currentWebView = null;
+            final ProxySpec proxy;
+            try {
+                store.setCurrent(id);
+                railAdapter.setCurrent(id);
+                drawerAdapter.setCurrent(id);
+                proxy = ProxySpec.parse(account.proxy);
+            } catch (RuntimeException e) {
+                showErrorOverlay("无法切换账号，请检查账号数据和代理配置");
+                return;
             }
-            if (existed && (interruptedLoads.contains(id) || webErrored.get(id, false) || !webLoaded.get(id, false))) {
-                interruptedLoads.remove(id);
-                webErrored.put(id, false);
-                loadStartAt.put(id, SystemClock.uptimeMillis());
-                target.reload();
+            if (!resumed) return;
+            hideErrorOverlay();
+            boolean cached = Objects.equals(appliedProxy, proxy.value) && webViews.contains(id);
+            if (!cached || animate || !webLoaded.get(id, false)) showSplashFor(account, !cached);
+            drawerLayout.closeDrawer(drawerContent);
+            // Creating a renderer/profile or changing proxy can be expensive. Let the drawer finish first.
+            if (cached) activateAccount(id, token, proxy);
+            else pageActivation.submit(() -> activateAccount(id, token, proxy));
+        } finally { Trace.endSection(); }
+    }
+
+    private void activateAccount(long id, long token, ProxySpec proxy) {
+        if (!initialized || !resumed || token != switchGeneration || store.getCurrentId() != id) return;
+        Trace.beginSection("Muse.activateAccount");
+        try {
+            // 只有相同代理的页面可继续驻留；出口变化时先关闭旧页面连接。
+            if (!Objects.equals(appliedProxy, proxy.value)) {
+                for (Map.Entry<Long, WebView> entry : webViews.snapshot().entrySet()) {
+                    destroyWebView(entry.getKey(), webViews.remove(entry.getKey()));
+                }
             }
-            if (webLoaded.get(id, false)) hideSplash();
-            fileSelection.deliverTo(target);
-        });
+            ProxyHelper.apply(proxy.value, error -> {
+                if (!initialized || !resumed || token != switchGeneration || store.getCurrentId() != id) return;
+                if (error != null) { showErrorOverlay(error); return; }
+                appliedProxy = proxy.value;
+                Account latest = store.findById(id);
+                if (latest == null) return;
+                WebView target = webViews.get(id);
+                boolean existed = target != null;
+                if (target == null) target = getOrCreateWebView(latest, proxy);
+                if (target == null) { showErrorOverlay("创建隔离环境失败，请重试"); return; }
+                currentWebView = target;
+                target.getSettings().setBlockNetworkLoads(false);
+                WebViewCompat.getProfile(target).getServiceWorkerController().getServiceWorkerWebSettings()
+                        .setBlockNetworkLoads(false);
+                target.setVisibility(View.VISIBLE);
+                target.onResume();
+                frozenPages.remove(target);
+                for (LruAccountRegistry.Evicted<WebView> evicted : webViews.touchAndEvict(id, target)) {
+                    destroyWebView(evicted.id, evicted.value);
+                }
+                if (existed && (interruptedLoads.contains(id) || webErrored.get(id, false) || !webLoaded.get(id, false))) {
+                    interruptedLoads.remove(id);
+                    webErrored.put(id, false);
+                    loadStartAt.put(id, SystemClock.uptimeMillis());
+                    target.reload();
+                }
+                if (webLoaded.get(id, false)) hideSplash();
+                fileSelection.deliverTo(target);
+            });
+        } finally { Trace.endSection(); }
     }
 
     private void showAccountMenu(View anchor, Account account) {
@@ -861,25 +955,30 @@ public class MainActivity extends AppCompatActivity {
         if (!initialized || !resumed) return;
         long current = store.getCurrentId();
         if (current > 0) sessionChecks.request(current);
-        for (Account account : store.all()) sessionChecks.request(account.id);
+        railAvatars.postOnAnimation(() -> requestVisibleSessions(railAvatars));
+        if (drawerLayout.isDrawerOpen(drawerContent)) accountList.postOnAnimation(() -> requestVisibleSessions(accountList));
     }
 
     private void checkAccountSession(long id) {
-        if (!initialized || !resumed) return;
-        Account account = store.findById(id);
-        if (account == null) return;
+        Trace.beginSection("Muse.checkSession");
         try {
-            Profile profile = profileStore.getProfile(profileName(id));
-            if (profile != null && (id != store.getCurrentId() || currentWebView == null)) {
-                profile.getServiceWorkerController().getServiceWorkerWebSettings().setBlockNetworkLoads(true);
-            }
-            String cookies = profile == null ? null : profile.getCookieManager().getCookie(START_URL);
-            boolean logged = TextRules.hasSession(cookies);
-            if (logged != account.logged) {
-                account.logged = logged;
-                renderAccounts();
-            }
-        } catch (RuntimeException ignored) { }
+            if (!initialized || !resumed) return;
+            Account account = store.findById(id);
+            if (account == null) return;
+            try {
+                Profile profile = profileStore.getProfile(profileName(id));
+                if (profile != null && (id != store.getCurrentId() || currentWebView == null)) {
+                    profile.getServiceWorkerController().getServiceWorkerWebSettings().setBlockNetworkLoads(true);
+                }
+                String cookies = profile == null ? null : profile.getCookieManager().getCookie(START_URL);
+                boolean logged = TextRules.hasSession(cookies);
+                if (logged != account.logged) {
+                    account.logged = logged;
+                    railAdapter.refreshState(id);
+                    drawerAdapter.refreshState(id);
+                }
+            } catch (RuntimeException ignored) { }
+        } finally { Trace.endSection(); }
     }
 
     private String profileName(long id) {
@@ -888,116 +987,87 @@ public class MainActivity extends AppCompatActivity {
 
     // ---------- 渲染 ----------
 
-    private void renderAccounts() {
-        if (!initialized) return;
-        List<Account> accounts = store.all();
-        String query = query().toLowerCase(Locale.ROOT);
-        long current = store.getCurrentId();
-        int shown = railViews.update(accounts, current, account -> matches(account, query));
-        drawerViews.update(accounts, current, account -> matches(account, query));
-        AccountRow.setText(accCount, query.isEmpty() ? getString(R.string.accounts_count_fmt, accounts.size())
-                : getString(R.string.search_results_fmt, shown, accounts.size()));
-        emptyState.setVisibility(accounts.isEmpty() ? View.VISIBLE : View.GONE);
-        drawerEmpty.setVisibility(!query.isEmpty() && shown == 0 ? View.VISIBLE : View.GONE);
+    private void configureAccountList(RecyclerView list) {
+        list.setLayoutManager(new LinearLayoutManager(this));
+        list.setHasFixedSize(true);
+        list.setItemAnimator(null); // Avoid change animations when a cookie/status changes.
+        list.addOnScrollListener(new RecyclerView.OnScrollListener() {
+            @Override public void onScrolled(RecyclerView view, int dx, int dy) {
+                // Also delivered with zero deltas when layout changes the visible range.
+                // Queue checks after layout, including new holders from an asynchronous diff.
+                if (view.getScrollState() == RecyclerView.SCROLL_STATE_IDLE) requestVisibleSessions(view);
+            }
+            @Override public void onScrollStateChanged(RecyclerView view, int state) {
+                sessionScheduler.setBusy(view, state != RecyclerView.SCROLL_STATE_IDLE);
+                if (state == RecyclerView.SCROLL_STATE_IDLE) requestVisibleSessions(view);
+            }
+        });
     }
 
-    private String query() {
-        return searchInput != null ? searchInput.getText().toString().trim() : "";
+    private boolean hasSession(long id) {
+        Account account = store.findById(id);
+        return account != null && account.logged;
     }
 
-    /** 按 名称 + 标签 过滤（忽略大小写，空 query 全匹配） */
-    private boolean matches(Account a, String q) {
-        if (q.isEmpty()) return true;
-        String key = q;
-        if (a.name.toLowerCase(Locale.ROOT).contains(key)) return true;
-        for (String t : a.tags) {
-            if (t.toLowerCase(Locale.ROOT).contains(key)) return true;
+    private void showAccountMenuById(View anchor, Long id) {
+        Account account = store.findById(id);
+        if (account != null) showAccountMenu(anchor, account);
+    }
+
+    private void requestVisibleSessions(RecyclerView list) {
+        if (!initialized || !resumed || !list.isShown()) return;
+        if (list == accountList && !drawerLayout.isDrawerOpen(drawerContent)) return;
+        for (int i = 0; i < list.getChildCount(); i++) {
+            RecyclerView.ViewHolder holder = list.getChildViewHolder(list.getChildAt(i));
+            if (holder instanceof AccountAdapter.Holder) sessionChecks.request(((AccountAdapter.Holder) holder).id);
         }
-        return false;
     }
 
-    private void showSplashFor(Account a) {
+    private void renderAccounts() {
+        Trace.beginSection("Muse.accountMetadata");
+        try {
+            if (!initialized) return;
+            List<AccountItem> items = new ArrayList<>();
+            for (Account account : store.all()) items.add(new AccountItem(account));
+            accountItems = Collections.unmodifiableList(items);
+            railAdapter.setCurrent(store.getCurrentId());
+            drawerAdapter.setCurrent(store.getCurrentId());
+            emptyState.setVisibility(items.isEmpty() ? View.VISIBLE : View.GONE);
+            filterAccounts();
+        } finally { Trace.endSection(); }
+    }
+
+    private void filterAccounts() {
+        Trace.beginSection("Muse.filterAccounts");
+        try {
+            if (!initialized) return;
+            String query = searchInput.getText().toString().trim().toLowerCase(Locale.ROOT);
+            List<AccountItem> matching = new ArrayList<>();
+            for (AccountItem item : accountItems) if (item.matches(query)) matching.add(item);
+            int generation = ++filterGeneration;
+            railAdapter.submitList(matching, () -> {
+                if (initialized && generation == filterGeneration) railAvatars.postOnAnimation(() -> requestVisibleSessions(railAvatars));
+            });
+            drawerAdapter.submitList(matching, () -> {
+                if (!initialized || generation != filterGeneration) return;
+                footerAdapter.setEmptySearch(!query.isEmpty() && matching.isEmpty());
+                AccountRow.setText(accCount, query.isEmpty() ? getString(R.string.accounts_count_fmt, accountItems.size())
+                        : getString(R.string.search_results_fmt, matching.size(), accountItems.size()));
+                accountList.postOnAnimation(() -> requestVisibleSessions(accountList));
+            });
+        } finally { Trace.endSection(); }
+    }
+
+    private void showSplashFor(Account a, boolean cold) {
+        if (!cold && webLoaded.get(a.id, false)) { hideSplash(); return; }
         splashName.setText(a.name);
         ((TextView) findViewById(R.id.splashTile)).setText(
                 a.avatar == null || a.avatar.isEmpty() ? "m" : a.avatar);
-        splash.setVisibility(View.VISIBLE);
-        splashShownAt = SystemClock.uptimeMillis();
-        webContainer.removeCallbacks(hideSplashRunnable);
-        // 已加载过的账号不会再次触发 onPageFinished，直接短延时收起
-        Boolean loaded = webLoaded.get(a.id);
-        if (loaded != null && loaded) {
-            hideSplash();
-            return;
-        }
-        // 兜底：加载异常时也不会卡在过渡层
-        webContainer.postDelayed(hideSplashRunnable, SPLASH_TIMEOUT_MS);
+        loadingOverlay.begin();
     }
 
     private void hideSplash() {
-        webContainer.removeCallbacks(hideSplashRunnable);
-        splash.setVisibility(View.GONE);
-    }
-
-    private View makeRailAvatar(Account a) {
-        FrameLayout wrap = new FrameLayout(this);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(48), dp(48));
-        lp.topMargin = dp(4);
-        lp.bottomMargin = dp(4);
-        wrap.setLayoutParams(lp);
-        wrap.setBackgroundResource(a.id == store.getCurrentId()
-                ? R.drawable.bg_rail_active : R.drawable.bg_rail_btn);
-
-        TextView tile = makeTile(dp(38), 20, a.avatar);
-        wrap.addView(tile, new FrameLayout.LayoutParams(dp(38), dp(38), Gravity.CENTER));
-
-        View dot = new View(this);
-        dot.setBackgroundResource(a.logged ? R.drawable.bg_dot_on : R.drawable.bg_dot_off);
-        FrameLayout.LayoutParams dlp = new FrameLayout.LayoutParams(dp(10), dp(10),
-                Gravity.BOTTOM | Gravity.END);
-        dlp.rightMargin = dp(1);
-        dlp.bottomMargin = dp(1);
-        wrap.addView(dot, dlp);
-
-        wrap.setFocusable(true);
-        wrap.setOnClickListener(v -> switchTo(a.id, true));
-        bindRailAvatar(wrap, a, a.id == store.getCurrentId());
-        return wrap;
-    }
-
-    private void bindRailAvatar(View view, Account account, boolean selected) {
-        FrameLayout wrap = (FrameLayout) view;
-        if (wrap.isSelected() != selected) {
-            wrap.setBackgroundResource(selected ? R.drawable.bg_rail_active : R.drawable.bg_rail_btn);
-            wrap.setSelected(selected);
-        }
-        AccountRow.setText((TextView) wrap.getChildAt(0),
-                account.avatar == null || account.avatar.isEmpty() ? "m" : account.avatar);
-        wrap.getChildAt(1).setBackgroundResource(account.logged ? R.drawable.bg_dot_on : R.drawable.bg_dot_off);
-        wrap.setContentDescription(account.name + "，" + getString(
-                account.logged ? R.string.status_logged : R.string.status_not_logged));
-        wrap.setTooltipText(account.name);
-    }
-
-    private View makeDrawerRow(Account account) {
-        long id = account.id;
-        return AccountRow.create(accountList, account, id == store.getCurrentId(),
-                view -> switchTo(id, true), view -> {
-                    Account latest = store.findById(id);
-                    if (latest != null) showAccountMenu(view, latest);
-                });
-    }
-
-    private TextView makeTile(int sizePx, float textSp, String text) {
-        TextView t = new TextView(this);
-        t.setBackgroundResource(R.drawable.bg_mtile);
-        t.setText(text == null || text.isEmpty() ? "m" : text);
-        t.setTypeface(Typeface.create("serif", Typeface.BOLD_ITALIC));
-        t.setTextColor(0xFF2F7CF6);
-        t.setTextSize(textSp);
-        t.setGravity(Gravity.CENTER);
-        t.setIncludeFontPadding(false);
-        t.setLayoutParams(new ViewGroup.LayoutParams(sizePx, sizePx));
-        return t;
+        loadingOverlay.hide();
     }
 
     // ---------- 其他 ----------

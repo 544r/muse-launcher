@@ -1,0 +1,9 @@
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="wrap_content"
+    android:orientation="vertical" android:padding="16dp">
+    <TextView android:id="@+id/drawerEmpty" style="@style/UiHint"
+        android:text="@string/search_empty" android:gravity="center"
+        android:paddingTop="20dp" android:paddingBottom="24dp" android:visibility="gone" />
+    <TextView style="@style/UiHint" android:text="@string/drawer_footnote"
+        android:paddingTop="12dp" android:paddingBottom="12dp" />
+</LinearLayout>

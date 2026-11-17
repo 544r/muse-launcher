@@ -4,7 +4,7 @@ import java.util.LinkedHashSet;
 import java.util.function.Consumer;
 import java.util.function.LongConsumer;
 
-/** Main-thread queue: deduplicate requests and inspect at most one profile per scheduled frame. */
+/** Deduplicate requests and inspect one profile per idle slot supplied by the scheduler. */
 final class SessionChecks {
     private final LinkedHashSet<Long> pending = new LinkedHashSet<>();
     private final Consumer<Runnable> schedule, unschedule;

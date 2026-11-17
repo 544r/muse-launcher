@@ -11,7 +11,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.function.Predicate;
 
-/** Keep account views attached during status changes; only change structure for filtering/add/remove. */
+/** v1.2.3 baseline retained only for comparative tests; never shipped in the app. */
 final class AccountViews {
     interface Factory { View create(Account account, boolean selected); }
     interface Binder { void bind(View view, Account account, boolean selected); }
